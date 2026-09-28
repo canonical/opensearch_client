@@ -1,0 +1,9 @@
+# .reposcan-ignore
+#   <tool>  <ruleId>  <path-glob>  [<content pattern>]
+
+# silence zizmor and semgrep warnings about unpinned tag on first-party action
+zizmor   zizmor/unpinned-uses  .github/workflows/*.yaml  "uses: canonical/reposcan@main"
+semgrep  *mutable-action-tag   .github/workflows/*.yaml  "uses: canonical/reposcan@main"
+
+# silence poutine unverified creator notes
+poutine  github_action_from_unverified_creator_used  .github/workflows/reposcan.yaml  "canonical/reposcan@main"
