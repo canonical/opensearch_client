@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Functional tests for osclient.logging against a live OpenSearch cluster.
+"""Functional tests for osclient.log_handler against a live OpenSearch cluster.
 
 These need the same ``OPENSEARCH_URL`` / ``OPENSEARCH_USER`` /
 ``OPENSEARCH_PASSWORD`` variables as ``test_osclient.py`` and are skipped when any
@@ -16,7 +16,7 @@ import uuid
 import pytest
 
 from osclient.config import client_from_env
-from osclient.logging import OpensearchHandler
+from osclient.log_handler import OpensearchHandler
 
 if not (
     os.environ.get("OPENSEARCH_URL")
