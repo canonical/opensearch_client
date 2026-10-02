@@ -5,6 +5,7 @@
 
 import json
 from collections.abc import Iterable
+from time import sleep
 from typing import Any, NamedTuple
 
 from osclient.jdbc import rows_from_sql_response
@@ -15,6 +16,61 @@ DEFAULT_INDEX = "*"
 
 # Default byte ceiling for one _bulk request body; batches are packed under it.
 BULK_MAX_BYTES = 10_000_000
+
+# Seconds ``bulk`` waits before its first retry. Each later retry waits twice as
+# long as the one before, up to BULK_RETRY_MAX_DELAY.
+BULK_RETRY_BASE_DELAY = 1.0
+BULK_RETRY_MAX_DELAY = 60.0
+
+# How ``bulk`` classifies a failed document. Only a transient failure is retried.
+# 1. An error type listed below decides first, permanent before transient, even
+#    when the status points the other way (a 403 ``cluster_block_exception`` and a
+#    404 ``index_not_found_exception`` are transient).
+# 2. Otherwise the status decides, using the status sets below.
+# 3. Anything unrecognized is transient: retrying a hopeless document costs a few
+#    delayed attempts, while giving up on a recoverable one loses it.
+TRANSIENT_ERRORS = frozenset({"cluster_block_exception", "index_not_found_exception"})
+PERMANENT_ERRORS = frozenset(
+    {
+        "document_parsing_exception",
+        "illegal_argument_exception",
+        "mapper_parsing_exception",
+        "strict_dynamic_mapping_exception",
+        "version_conflict_engine_exception",
+    }
+)
+# Statuses are listed for visibility: an unlisted status is transient anyway, so
+# TRANSIENT_STATUSES does not change any result.
+TRANSIENT_STATUSES = frozenset(
+    {
+        408,  # request timeout
+        425,  # too early
+        429,  # too many requests (also a full write queue or a blocked index)
+        500,  # internal server error
+        502,  # bad gateway
+        503,  # service unavailable
+        504,  # gateway timeout
+        507,  # insufficient storage
+    }
+)
+PERMANENT_STATUSES = frozenset(
+    {
+        400,  # bad request
+        401,  # unauthorized
+        403,  # forbidden
+        404,  # not found
+        405,  # method not allowed
+        406,  # not acceptable
+        409,  # conflict
+        410,  # gone
+        413,  # payload too large (a single document, as batches are halved)
+        414,  # URI too long
+        415,  # unsupported media type
+        422,  # unprocessable content
+        501,  # not implemented
+        505,  # HTTP version not supported
+    }
+)
 
 
 class BulkItem(NamedTuple):
@@ -85,6 +141,37 @@ def _tally_bulk_items(
             summary["indexed"] += 1
         else:
             failures.append((item, {"status": outcome.get("status"), "error": error}))
+
+
+def _is_transient(info: dict[str, Any]) -> bool:
+    """Check whether a failed document is worth retrying.
+
+    A listed error type decides first, then the status. Anything unrecognized is
+    transient, so the document is retried rather than given up on.
+
+    Args:
+        info (dict[str, Any]): the failure's ``status`` and ``error`` (a per-item
+            error) or ``reason`` (a failed request).
+
+    Returns:
+        bool: True if the failure is transient, False if it is permanent.
+    """
+    # If possible, classify error by type
+    error = info.get("error")
+    error_type = error.get("type") if isinstance(error, dict) else None
+    if error_type in PERMANENT_ERRORS:
+        return False
+    if error_type in TRANSIENT_ERRORS:
+        return True
+
+    # Classify by status (if not explicitly defined, assume transient)
+    status = info.get("status")
+
+    if status is None or status in TRANSIENT_STATUSES:
+        return True
+    if status in PERMANENT_STATUSES:
+        return False
+    return True
 
 
 def _query_string(params: dict[str, Any]) -> str:
@@ -301,7 +388,10 @@ class OpensearchClient:
         Every 200's per-item results are inspected, so a document that failed
         inside an otherwise-2xx bulk response is not trusted as written. Any failed
         document, whether from a failed batch or a per-item error, is retried up to
-        ``max_retries`` times (``max_retries=0`` disables retries).
+        ``max_retries`` times (``max_retries=0`` disables retries), but only if its
+        failure is classified as transient. A permanent failure is reported without
+        being resent. Each retry waits longer than the last: 1 second, then 2, 4, 8
+        and so on, up to 60 seconds.
 
         Returns a summary: ``indexed`` and ``failed`` document counts, the number
         of ``batches`` sent, and a ``failures`` list (each with the offending
@@ -320,12 +410,24 @@ class OpensearchClient:
         }
 
         failures = self._send_bulk(pending, max_bytes, action, summary)
+        permanent_failures: list[BulkFailure] = []
+        retry_delay = BULK_RETRY_BASE_DELAY
         for _ in range(max_retries):
+            transient: list[BulkFailure] = []
+            for failure in failures:
+                if _is_transient(failure[1]):
+                    transient.append(failure)
+                else:
+                    permanent_failures.append(failure)
+            failures = transient
             if not failures:
                 break
+            sleep(retry_delay)
             failures = self._send_bulk(
                 [item for item, _ in failures], max_bytes, action, summary
             )
+            retry_delay = min(retry_delay * 2, BULK_RETRY_MAX_DELAY)
+        failures.extend(permanent_failures)
 
         for item, info in failures:
             summary["failed"] += 1
