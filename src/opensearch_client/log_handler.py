@@ -5,7 +5,7 @@
 
 The handler is a standard :class:`logging.Handler`: attach it to a logger, and
 every record that reaches it is indexed into OpenSearch through an
-:class:`~osclient.client.OpensearchClient`. Batching, retries and transport
+:class:`~opensearch_client.client.OpensearchClient`. Batching, retries and transport
 selection are delegated to :meth:`OpensearchClient.bulk`; this module only adds
 what a log handler needs on top of it:
 
@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from threading import Event, Lock, Thread, current_thread
 from typing import Any
 
-from osclient.client import OpensearchClient
+from opensearch_client.client import OpensearchClient
 
 # How long flush() waits for the flush thread to finish a send. Bounded so that
 # logging.shutdown cannot hang when OpenSearch is unreachable.
@@ -187,7 +187,7 @@ class OpensearchHandler(logging.Handler):
         self._wake_event = Event()
         self._stop_event = Event()
         self._flush_thread = Thread(
-            target=self._run, name="osclient-log-flush", daemon=True
+            target=self._run, name="opensearch_client-log-flush", daemon=True
         )
         # Filter out records emitted by the flushing thread
         self.addFilter(lambda record: current_thread() is not self._flush_thread)
@@ -277,7 +277,7 @@ class OpensearchHandler(logging.Handler):
                 "ephemeral_id": os.environ.get("INVOCATION_ID") or uuid.uuid4().hex,
             },
             "event": {"dataset": service_name},
-            "agent": {"type": "osclient"},
+            "agent": {"type": "opensearch_client"},
         }
 
         _deep_merge(document, extra_fields)

@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Unit tests for osclient.cli.io: input resolution and output rendering."""
+"""Unit tests for opensearch_client.cli.io: input resolution and output rendering."""
 
 import io
 import json
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 import yaml
 
-from osclient.cli.io import (
+from opensearch_client.cli.io import (
     parse_json_object,
     render,
     resolve_source,

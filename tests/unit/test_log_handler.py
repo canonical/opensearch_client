@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Unit tests for osclient.log_handler.OpensearchHandler.
+"""Unit tests for opensearch_client.log_handler.OpensearchHandler.
 
 The handler talks to a ``FakeClient`` that answers the three client calls it
 makes. Requests, batching, retries and their delays belong to OpensearchClient and
@@ -18,10 +18,10 @@ import time
 from collections.abc import Generator, Iterable
 from typing import Any, cast
 
-from osclient import log_handler
-from osclient.client import OpensearchClient
-from osclient.log_handler import OpensearchHandler
-from osclient.result import Failure, OpensearchResult, Success
+from opensearch_client import log_handler
+from opensearch_client.client import OpensearchClient
+from opensearch_client.log_handler import OpensearchHandler
+from opensearch_client.result import Failure, OpensearchResult, Success
 
 # How long the tests wait on another thread before deciding it is stuck. Only
 # reached when the code under test is broken.
@@ -272,7 +272,7 @@ def test_documents_carry_identity_labels_and_merged_extra_fields() -> None:
         assert first_document["@timestamp"] == "2023-11-14T22:13:20.123Z"
         assert first_document["ecs"] == {"version": "9.0"}
         assert first_document["host"] == {"name": socket.gethostname()}
-        assert first_document["agent"]["type"] == "osclient"
+        assert first_document["agent"]["type"] == "opensearch_client"
         # extra_fields are merged into service, not a replacement for it.
         service = first_document["service"]
         assert service["name"] == "superset"
