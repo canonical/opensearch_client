@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Functional tests for osclient against a live OpenSearch cluster.
+"""Functional tests for opensearch_client against a live OpenSearch cluster.
 
 These require a running OpenSearch reachable via the ``OPENSEARCH_*`` environment
 variables (``OPENSEARCH_URL``, ``OPENSEARCH_USER``, ``OPENSEARCH_PASSWORD``); when
@@ -17,8 +17,8 @@ from typing import Iterator
 
 import pytest
 
-from osclient import OpensearchClient, triage
-from osclient.config import client_from_env
+from opensearch_client import OpensearchClient, triage
+from opensearch_client.config import client_from_env
 
 if not (
     os.environ.get("OPENSEARCH_URL")
@@ -79,7 +79,7 @@ def _unique(prefix: str) -> str:
 
 
 def test_index_and_read_back() -> None:
-    index = _unique("osclient-func")
+    index = _unique("opensearch_client-func")
     with _temporary_indices(index):
         assert _client.create_index(
             {"mappings": {"properties": {"name": {"type": "keyword"}}}}, index=index
@@ -103,8 +103,8 @@ def test_index_and_read_back() -> None:
 
 
 def test_triage_workflow_eliminates_a_layer() -> None:
-    source = _unique("osclient-func-src")
-    dest = _unique("osclient-func-triage")
+    source = _unique("opensearch_client-func-src")
+    dest = _unique("opensearch_client-func-triage")
     with _temporary_indices(source, dest):
         assert _client.create_index(
             {
@@ -162,20 +162,20 @@ def test_triage_workflow_eliminates_a_layer() -> None:
 
 
 def test_index_lifecycle_helpers() -> None:
-    index = _unique("osclient-func-lifecycle")
+    index = _unique("opensearch_client-func-lifecycle")
     with _temporary_indices(index):
         assert _client.create_index({}, index=index).ok
         assert _client.index_exists(index).data is True
         assert _client.index_document({"n": 1}, index=index).ok
         assert _client.refresh(index=index).ok
-        listed = _client.list_indices("osclient-func-lifecycle-*")
+        listed = _client.list_indices("opensearch_client-func-lifecycle-*")
         assert listed and index in listed.data
         assert _client.delete_index(index).ok
         assert _client.index_exists(index).data is False
 
 
 def test_bulk_indexes_documents_across_batches() -> None:
-    index = _unique("osclient-func-bulk")
+    index = _unique("opensearch_client-func-bulk")
     with _temporary_indices(index):
         docs = [{"name": f"host-{i}", "n": i} for i in range(50)]
         # A small byte cap forces the 50 documents across several batches.
@@ -195,7 +195,7 @@ def test_bulk_indexes_documents_across_batches() -> None:
 
 
 def test_bulk_reports_a_rejected_document() -> None:
-    index = _unique("osclient-func-bulk-reject")
+    index = _unique("opensearch_client-func-bulk-reject")
     with _temporary_indices(index):
         assert _client.create_index(
             {"mappings": {"properties": {"n": {"type": "integer"}}}}, index=index
@@ -218,7 +218,7 @@ def test_bulk_reports_a_rejected_document() -> None:
 
 
 def test_index_template_pins_a_field_type_before_the_first_document() -> None:
-    name = _unique("osclient-func-template")
+    name = _unique("opensearch_client-func-template")
     index = f"{name}-2026.41"
     event_mapping = {"properties": {"kind": {"type": "keyword"}}}
     template = {
@@ -256,7 +256,7 @@ def test_index_template_pins_a_field_type_before_the_first_document() -> None:
 
 
 def test_component_templates_compose_into_an_index_template() -> None:
-    name = _unique("osclient-func-component")
+    name = _unique("opensearch_client-func-component")
     component = f"{name}-fields"
     index = f"{name}-2026.41"
     field_mapping = {"type": "keyword"}
@@ -290,7 +290,7 @@ def test_component_templates_compose_into_an_index_template() -> None:
 
 
 def test_rollover_dry_run_creates_nothing_and_settings_apply_to_the_new_index() -> None:
-    prefix = _unique("osclient-func-rollover")
+    prefix = _unique("opensearch_client-func-rollover")
     alias = f"{prefix}-write"
     first, second = f"{prefix}-000001", f"{prefix}-000002"
     with _temporary_indices(first, second):
