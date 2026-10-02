@@ -1,9 +1,9 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Unit tests for osclient.cli.index."""
+"""Unit tests for opensearch_client.cli.index."""
 
-from osclient.cli import index
+from opensearch_client.cli import index
 
 
 def test_load_documents_parses_each_format() -> None:

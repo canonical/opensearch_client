@@ -1,13 +1,13 @@
 # CLI
 
-The `osclient` package offers a CLI entry point, `osclient`, with subcommands.
+The `opensearch_client` package offers a CLI entry point, `opensearch_client`, with subcommands.
 
 ## Usage
 
 Every invocation has the form:
 
 ```
-osclient <subcommand> [options]
+opensearch_client <subcommand> [options]
 ```
 
 The subcommands are:
@@ -29,7 +29,7 @@ command-line equivalent of `OPENSEARCH_INSECURE=1` and goes before the
 subcommand:
 
 ```
-osclient --insecure query sql "SELECT rule.level FROM logs-* LIMIT 5"
+opensearch_client --insecure query sql "SELECT rule.level FROM logs-* LIMIT 5"
 ```
 
 ## Output format
@@ -38,9 +38,9 @@ Every command that prints data takes `--format`, one of `yaml` (the default),
 `json`, `csv`, or `tsv`:
 
 ```
-osclient query sql "SELECT client_ip FROM logs-*" --format json | jq '.[].client_ip'
-osclient query sql "SELECT client_ip FROM logs-*" --format csv > stack.csv
-osclient query sql "SELECT client_ip FROM logs-*" --format tsv | column -t
+opensearch_client query sql "SELECT client_ip FROM logs-*" --format json | jq '.[].client_ip'
+opensearch_client query sql "SELECT client_ip FROM logs-*" --format csv > stack.csv
+opensearch_client query sql "SELECT client_ip FROM logs-*" --format tsv | column -t
 ```
 
 The tabular formats (`csv`, `tsv`) render one record per row. Nested objects
@@ -66,10 +66,10 @@ A relative offset starts with `-`, which the argument parser would read as a
 flag, so pass it with `=`:
 
 ```
-osclient query sql "SELECT ..." --since=-24h
-osclient search source.ip=10.0.0.5 --since=-7d --count 20
-osclient query sql "SELECT ..." --since 2026-03-14T00:00:00 --until 2026-03-15T00:00:00
-osclient query dsl @rule.json --since=-3d --time-field event.created
+opensearch_client query sql "SELECT ..." --since=-24h
+opensearch_client search source.ip=10.0.0.5 --since=-7d --count 20
+opensearch_client query sql "SELECT ..." --since 2026-03-14T00:00:00 --until 2026-03-15T00:00:00
+opensearch_client query dsl @rule.json --since=-3d --time-field event.created
 ```
 
 How the bound is applied depends on the command:
@@ -82,7 +82,7 @@ How the bound is applied depends on the command:
 `--since` / `--until` cannot be combined with `--explain`, which shows the
 query's plan and is not affected by a separate filter.
 
-## `osclient query`
+## `opensearch_client query`
 
 `query` runs a query in a chosen language and prints the result as YAML. Each
 `<query>` may be given literally, as `-` to read it from stdin, or as `@PATH` to
@@ -92,10 +92,10 @@ Run a SQL query. `--explain` prints its execution plan (the pushed-down DSL)
 instead of running it:
 
 ```
-osclient query sql "SELECT rule.level FROM logs-* LIMIT 5"
-osclient query sql --explain "SELECT * FROM logs-* WHERE rule.level < 3"
-osclient query sql @failed-logins.sql
-osclient query sql - <<'EOF'
+opensearch_client query sql "SELECT rule.level FROM logs-* LIMIT 5"
+opensearch_client query sql --explain "SELECT * FROM logs-* WHERE rule.level < 3"
+opensearch_client query sql @failed-logins.sql
+opensearch_client query sql - <<'EOF'
 SELECT client_ip, COUNT(*) FROM logs-*
 WHERE `event.outcome` = 'failure'
 GROUP BY client_ip
@@ -105,8 +105,8 @@ EOF
 Run a PPL query; `--explain` works here too:
 
 ```
-osclient query ppl "source=logs-* | head 5"
-osclient query ppl --explain "source=logs-* | where rule.level > 10"
+opensearch_client query ppl "source=logs-* | head 5"
+opensearch_client query ppl --explain "source=logs-* | where rule.level > 10"
 ```
 
 Run a raw query DSL: a bare query object, or a full `_search` body (detected by
@@ -115,12 +115,12 @@ matching documents, routed to `_count` (so `size`, `sort`, and any aggregations
 in the body are ignored):
 
 ```
-osclient query dsl '{"query": {"bool": {"must": [{"term": {"event.action": "logon"}}]}}}'
-osclient query dsl @rules/compiled/lateral-movement.json
-osclient query dsl @rule.json --count-only
+opensearch_client query dsl '{"query": {"bool": {"must": [{"term": {"event.action": "logon"}}]}}}'
+opensearch_client query dsl @rules/compiled/lateral-movement.json
+opensearch_client query dsl @rule.json --count-only
 ```
 
-## `osclient search`
+## `opensearch_client search`
 
 `search` finds the newest documents matching a set of exact `field=value` terms,
 ANDed together, most recent first. `--count` controls how many are returned;
@@ -128,12 +128,12 @@ ANDed together, most recent first. `--count` controls how many are returned;
 overrides the configured `OPENSEARCH_INDEX` for the search.
 
 ```
-osclient search rule.id=5710 agent.name=web01 --count 3
-osclient search source.ip=10.0.0.5 --count-only
-osclient search source.ip=10.0.0.5 --index logs-2026.07.14
+opensearch_client search rule.id=5710 agent.name=web01 --count 3
+opensearch_client search source.ip=10.0.0.5 --count-only
+opensearch_client search source.ip=10.0.0.5 --index logs-2026.07.14
 ```
 
-## `osclient index`
+## `opensearch_client index`
 
 `index` groups index-level operations. `mapping` shows the mapping for one or
 more fields (comma-separated, wildcards allowed). An empty result means the
@@ -142,8 +142,8 @@ when it appears in a document's `_source`. `--index` overrides the configured
 `OPENSEARCH_INDEX`:
 
 ```
-osclient index mapping "data.event.*"
-osclient index mapping source.ip --index logs-2026.07.14
+opensearch_client index mapping "data.event.*"
+opensearch_client index mapping source.ip --index logs-2026.07.14
 ```
 
 `create` makes a new index from a settings/mappings body, and `set mapping` adds
@@ -152,8 +152,8 @@ not change an existing field's type). Both read the JSON body from `SOURCE`
 (`@PATH`, `-`, or literal).
 
 ```
-osclient index create hunt-001 @index-body.json
-osclient index set mapping @mapping.json --index hunt-001
+opensearch_client index create hunt-001 @index-body.json
+opensearch_client index set mapping @mapping.json --index hunt-001
 ```
 
 `bulk` writes many documents into `--index` in one pass. `SOURCE` is the
@@ -164,9 +164,9 @@ object per line), or `yaml` (a sequence of mappings). It prints the run summary
 document failed:
 
 ```
-osclient index bulk @events.jsonl --index hunt-001 --input-format jsonl
-osclient index bulk @events.yaml  --index hunt-001 --input-format yaml
-osclient index bulk - --index hunt-001 --input-format json < events.json
+opensearch_client index bulk @events.jsonl --index hunt-001 --input-format jsonl
+opensearch_client index bulk @events.yaml  --index hunt-001 --input-format yaml
+opensearch_client index bulk - --index hunt-001 --input-format json < events.json
 ```
 
 The lifecycle verbs cover the common index-management operations:
@@ -180,21 +180,21 @@ The lifecycle verbs cover the common index-management operations:
   pattern dry run lists exactly which indices would be deleted.
 
 ```
-osclient index refresh --index hunt-001
-osclient index exists  --index hunt-001
-osclient index list --pattern "triage-*"
-osclient index delete  --index hunt-001 --apply
-osclient index delete  --pattern "scratch-*"          # dry run: lists the matches
-osclient index delete  --pattern "scratch-*" --apply
+opensearch_client index refresh --index hunt-001
+opensearch_client index exists  --index hunt-001
+opensearch_client index list --pattern "triage-*"
+opensearch_client index delete  --index hunt-001 --apply
+opensearch_client index delete  --pattern "scratch-*"          # dry run: lists the matches
+opensearch_client index delete  --pattern "scratch-*" --apply
 ```
 
-## `osclient cluster`
+## `opensearch_client cluster`
 
 `cluster` groups cluster-level inspection and configuration. `versions` reports
 the OpenSearch and installed-plugin versions:
 
 ```
-osclient cluster versions
+opensearch_client cluster versions
 ```
 
 `pipeline` shows ingest pipelines (all, or one by name), and `set pipeline`
@@ -202,12 +202,12 @@ creates or replaces one from a JSON definition read from `SOURCE` (`@PATH`, `-`,
 or literal).
 
 ```
-osclient cluster pipeline
-osclient cluster pipeline web-logs
-osclient cluster set pipeline web-logs @pipeline.json
+opensearch_client cluster pipeline
+opensearch_client cluster pipeline web-logs
+opensearch_client cluster set pipeline web-logs @pipeline.json
 ```
 
-## `osclient triage`
+## `opensearch_client triage`
 
 ### What triage does
 
@@ -278,7 +278,7 @@ Copy the logs of interest into a fresh index, tagging every document untriaged.
 The source index is only read, never modified:
 
 ```
-osclient triage init --source logs-2026.07.14 --dest triage-hunt-001
+opensearch_client triage init --source logs-2026.07.14 --dest triage-hunt-001
 ```
 
 Review the copied index (for example in a dashboard), pick a set you can
@@ -288,14 +288,14 @@ match, how many are still untriaged (and so would be tagged), the translated
 DSL, and a sample:
 
 ```
-osclient triage eliminate --index triage-hunt-001 --layer 1 --where "rule.level < 3" --explanation "informational, below alert threshold"
+opensearch_client triage eliminate --index triage-hunt-001 --layer 1 --where "rule.level < 3" --explanation "informational, below alert threshold"
 ```
 
 When the counts look right, re-run the same command with `--apply` to write the
 tags:
 
 ```
-osclient triage eliminate --index triage-hunt-001 --layer 1 --where "rule.level < 3" --explanation "informational, below alert threshold" --apply
+opensearch_client triage eliminate --index triage-hunt-001 --layer 1 --where "rule.level < 3" --explanation "informational, below alert threshold" --apply
 ```
 
 Check what remains, then repeat the review-and-eliminate step until the
@@ -303,7 +303,7 @@ untriaged count reaches zero. Omit `--layer` and each elimination
 auto-increments to the next layer (2, 3, ...):
 
 ```
-osclient triage status --index triage-hunt-001
+opensearch_client triage status --index triage-hunt-001
 ```
 
 If needed, `restore` undoes an elimination: it resets the matching documents to
@@ -312,8 +312,8 @@ resets exactly one layer; `--from-layer` resets that layer _and_ every
 subsequent one . The command is a dry run unless `--apply` is given:
 
 ```
-osclient triage restore --index triage-hunt-001 --layer 3               # dry run
-osclient triage restore --index triage-hunt-001 --from-layer 3 --apply
+opensearch_client triage restore --index triage-hunt-001 --layer 3               # dry run
+opensearch_client triage restore --index triage-hunt-001 --from-layer 3 --apply
 ```
 
 ### Predicate quoting
@@ -325,7 +325,7 @@ predicate in single quotes, or pass `--where -` to read the predicate from
 `stdin`, or `--where @PATH` to read it from a file:
 
 ```
-osclient triage eliminate --index triage-hunt-001 --layer 1 --explanation "received emails" --where - <<'EOF'
+opensearch_client triage eliminate --index triage-hunt-001 --layer 1 --explanation "received emails" --where - <<'EOF'
 `event.action` = 'delivery' AND `message` = 'Message received'
 EOF
 ```

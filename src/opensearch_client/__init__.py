@@ -5,16 +5,16 @@
 
 The public surface:
 
-    from osclient import OpensearchClient, OpensearchResult, client_from_env
+    from opensearch_client import OpensearchClient, OpensearchResult, client_from_env
 
 and, to ship log records to an index, ``OpensearchHandler``.
 """
 
-from osclient.client import DEFAULT_INDEX, OpensearchClient
-from osclient.config import client_from_env
-from osclient.log_handler import OpensearchHandler
-from osclient.result import Failure, OpensearchResult, Success
-from osclient.transport import (
+from opensearch_client.client import DEFAULT_INDEX, OpensearchClient
+from opensearch_client.config import client_from_env
+from opensearch_client.log_handler import OpensearchHandler
+from opensearch_client.result import Failure, OpensearchResult, Success
+from opensearch_client.transport import (
     DirectTransport,
     FailoverTransport,
     ProbeTransport,
