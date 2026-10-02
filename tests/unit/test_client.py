@@ -41,6 +41,21 @@ class _SeqTransport:
         return self._results[min(self.calls - 1, len(self._results) - 1)]
 
 
+def test_slow_admin_calls_wait_longer_than_the_default_and_accept_an_override() -> None:
+    calls: list[Callable[..., Any]] = [
+        lambda c, **kwargs: c.simulate_index("x-1", **kwargs),
+        lambda c, **kwargs: c.rollover("w", **kwargs),
+    ]
+    for call in calls:
+        transport = FakeTransport(Success({}))
+        client = OpensearchClient(transport)
+
+        call(client)
+        call(client, timeout=5)
+
+        assert [recorded[3] for recorded in transport.calls] == [120, 5]
+
+
 def test_request_delegates_to_the_transport() -> None:
     transport = FakeTransport(Success({"x": 1}))
     res = OpensearchClient(transport).request("PUT", "idx", {"b": 2}, timeout=99)
@@ -89,6 +104,57 @@ def test_helpers_build_the_expected_request() -> None:
             "PUT",
             "_ingest/pipeline/web",
             {"processors": []},
+        ),
+        (lambda c: c.get_index_template(), "GET", "_index_template", None),
+        (lambda c: c.get_index_template("t"), "GET", "_index_template/t", None),
+        (lambda c: c.get_legacy_template(), "GET", "_template", None),
+        (lambda c: c.get_legacy_template("t"), "GET", "_template/t", None),
+        (
+            lambda c: c.put_index_template("t", {"index_patterns": ["x-*"]}),
+            "PUT",
+            "_index_template/t",
+            {"index_patterns": ["x-*"]},
+        ),
+        (lambda c: c.delete_index_template("t"), "DELETE", "_index_template/t", None),
+        (
+            lambda c: c.simulate_template("t", {"index_patterns": ["x-*"]}),
+            "POST",
+            "_index_template/_simulate/t",
+            {"index_patterns": ["x-*"]},
+        ),
+        (
+            lambda c: c.simulate_index("x-1"),
+            "POST",
+            "_index_template/_simulate_index/x-1",
+            None,
+        ),
+        (lambda c: c.get_component_template(), "GET", "_component_template", None),
+        (
+            lambda c: c.get_component_template("c"),
+            "GET",
+            "_component_template/c",
+            None,
+        ),
+        (
+            lambda c: c.put_component_template("c", {"template": {}}),
+            "PUT",
+            "_component_template/c",
+            {"template": {}},
+        ),
+        (
+            lambda c: c.delete_component_template("c"),
+            "DELETE",
+            "_component_template/c",
+            None,
+        ),
+        (lambda c: c.rollover("w"), "POST", "w/_rollover?dry_run=false", None),
+        (
+            lambda c: c.rollover(
+                "w", settings={"index.number_of_shards": 1}, dry_run=True
+            ),
+            "POST",
+            "w/_rollover?dry_run=true",
+            {"settings": {"index.number_of_shards": 1}},
         ),
         (lambda c: c.refresh(index="i"), "POST", "i/_refresh", None),
         (lambda c: c.delete_index("i"), "DELETE", "i", None),

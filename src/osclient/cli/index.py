@@ -139,6 +139,25 @@ def add_subparser(subparsers: _SubParsersAction) -> None:
     )
     add_format_argument(delete)
 
+    rollover = operations.add_parser(
+        "rollover",
+        help="roll a write alias over to a new index; dry-run unless --apply",
+        epilog="SOURCE is a JSON object of index settings: '@PATH' reads a file, "
+        "'-' reads stdin, or give the text literally.",
+    )
+    rollover.add_argument("alias", metavar="ALIAS", help="the write alias to roll over")
+    rollover.add_argument(
+        "--settings",
+        metavar="SOURCE",
+        help="settings for the new index only, overriding its template",
+    )
+    rollover.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually roll over; without it, only report the new index's name",
+    )
+    add_format_argument(rollover)
+
     listing = operations.add_parser("list", help="list indices matching a pattern")
     listing.add_argument(
         "--pattern", default="*", help="index-name pattern to list (default: all)"
@@ -275,5 +294,15 @@ def run(args: Namespace, client: OpensearchClient) -> None:
         emit(diagnose(client.index_exists(args.index)), "Exists", args.format)
     elif args.operation == "delete":
         _run_delete(args, client)
+    elif args.operation == "rollover":
+        settings = None
+        if args.settings is not None:
+            settings = parse_json_object(
+                resolve_source(args.settings), "rollover settings"
+            )
+            if settings is None:
+                sys.exit(2)
+        result = client.rollover(args.alias, settings=settings, dry_run=not args.apply)
+        emit(diagnose(result), "Rollover", args.format)
     elif args.operation == "list":
         emit(diagnose(client.list_indices(args.pattern)), "List", args.format)

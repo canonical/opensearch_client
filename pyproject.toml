@@ -11,7 +11,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "osclient"
-version = "0.1.1"
+version = "0.1.2"
 description = "OpenSearch client library."
 requires-python = ">=3.10"
 dependencies = [
