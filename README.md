@@ -1,4 +1,4 @@
-# osclient
+# opensearch_client
 
 OpenSearch client library
 
@@ -13,7 +13,7 @@ python3 -m pip install -e .
 or
 
 ```
-pipx install https://github.com/canonical/osclient.git
+pipx install git+https://github.com/canonical/opensearch_client.git
 ```
 
 Runtime dependencies: `requests`, `PyYAML`.
