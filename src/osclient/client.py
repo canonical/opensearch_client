@@ -411,6 +411,62 @@ class OpensearchClient:
         """
         return self.request("PUT", f"_ingest/pipeline/{name}", body)
 
+    def get_index_template(
+        self, name: str | None = None
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Get all composable index templates, or those matching ``name``."""
+        path = "_index_template" if name is None else f"_index_template/{name}"
+        return self.request("GET", path)
+
+    def get_legacy_template(
+        self, name: str | None = None
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Get all legacy (``_template``) templates, or those matching ``name``."""
+        path = "_template" if name is None else f"_template/{name}"
+        return self.request("GET", path)
+
+    def put_index_template(
+        self, name: str, body: dict[str, Any]
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Create or replace a composable index template."""
+        return self.request("PUT", f"_index_template/{name}", body)
+
+    def delete_index_template(self, name: str) -> OpensearchResult[dict[str, Any]]:
+        """Delete a composable index template."""
+        return self.request("DELETE", f"_index_template/{name}")
+
+    def simulate_template(
+        self, name: str, body: dict[str, Any]
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Resolve the index configuration of putting ``body`` as template ``name``."""
+        return self.request("POST", f"_index_template/_simulate/{name}", body)
+
+    def simulate_index(
+        self, index: str, *, timeout: int = 120
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Resolve the index configuration the installed templates give ``index``."""
+        # Simulate consistently exceeds the default REQUEST_TIMEOUT of 30 s.
+        return self.request(
+            "POST", f"_index_template/_simulate_index/{index}", timeout=timeout
+        )
+
+    def get_component_template(
+        self, name: str | None = None
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Get all component templates, or those matching ``name``."""
+        path = "_component_template" if name is None else f"_component_template/{name}"
+        return self.request("GET", path)
+
+    def put_component_template(
+        self, name: str, body: dict[str, Any]
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Create or replace a component template."""
+        return self.request("PUT", f"_component_template/{name}", body)
+
+    def delete_component_template(self, name: str) -> OpensearchResult[dict[str, Any]]:
+        """Delete a component template."""
+        return self.request("DELETE", f"_component_template/{name}")
+
     def refresh(self, index: str | None = None) -> OpensearchResult[dict[str, Any]]:
         """Refresh an index so its recent writes become searchable.
 
@@ -467,6 +523,24 @@ class OpensearchClient:
         if not res:
             return res
         return Success(sorted(row["index"] for row in res.data))
+
+    def rollover(
+        self,
+        alias: str,
+        *,
+        settings: dict[str, Any] | None = None,
+        dry_run: bool = False,
+        timeout: int = 120,
+    ) -> OpensearchResult[dict[str, Any]]:
+        """Roll the write alias ``alias`` over to a new index (``POST <alias>/_rollover``).
+
+        ``settings`` apply to the new index only and override its template.
+        ``dry_run=True`` reports the new index's name without creating it.
+        """
+        # Creating the new index takes over 30 s on staging.
+        body = None if settings is None else {"settings": settings}
+        path = f"{alias}/_rollover" + _query_string({"dry_run": dry_run})
+        return self.request("POST", path, body, timeout)
 
     def reindex(
         self,
