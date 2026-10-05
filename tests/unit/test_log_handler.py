@@ -558,11 +558,11 @@ def test_close_sends_the_remaining_records_and_stops_the_flush_thread() -> None:
 
 def test_a_record_emitted_after_close_is_counted_as_dropped() -> None:
     """A closed handler no longer queues records; it counts them as dropped."""
-    cluster = FakeCluster()
-    handler = _handler(cluster)
+    client = FakeClient()
+    handler = _build_handler(client)
     handler.close()
 
-    handler.emit(_record("late"))
+    handler.emit(_make_record("late"))
 
     assert handler.dropped == 1
-    assert cluster.documents == []
+    assert client.documents == []
