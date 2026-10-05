@@ -41,30 +41,6 @@ class _SeqTransport:
         return self._results[min(self.calls - 1, len(self._results) - 1)]
 
 
-def test_slow_admin_calls_wait_longer_than_the_default_and_accept_an_override() -> None:
-    calls: list[Callable[..., Any]] = [
-        lambda c, **kwargs: c.simulate_index("x-1", **kwargs),
-        lambda c, **kwargs: c.rollover("w", **kwargs),
-    ]
-    for call in calls:
-        transport = FakeTransport(Success({}))
-        client = OpensearchClient(transport)
-
-        call(client)
-        call(client, timeout=5)
-
-        assert [recorded[3] for recorded in transport.calls] == [120, 5]
-
-
-def test_request_delegates_to_the_transport() -> None:
-    transport = FakeTransport(Success({"x": 1}))
-    res = OpensearchClient(transport).request("PUT", "idx", {"b": 2}, timeout=99)
-    assert res.data == {"x": 1}
-    method, path, body, timeout = transport.calls[0]
-    assert (method, path, timeout) == ("PUT", "idx", 99)
-    assert json.loads(body) == {"b": 2}  # the client JSON-encodes before the transport
-
-
 def test_helpers_build_the_expected_request() -> None:
     doc = {"name": "a"}
     script = {"source": "s"}

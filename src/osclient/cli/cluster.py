@@ -235,11 +235,8 @@ def run(args: Namespace, client: OpensearchClient) -> None:
         if not result:
             emit(diagnose(result), "Delete template", args.format)
             return
-        patterns = [
-            pattern
-            for entry in result.data.get("index_templates", [])
-            for pattern in entry["index_template"].get("index_patterns", [])
-        ]
+        [entry] = result.data["index_templates"]
+        patterns = entry["index_template"].get("index_patterns", [])
         summary = {"template": args.name, "dry_run": True, "index_patterns": patterns}
         print(render(summary, args.format))
     elif args.operation == "component-template":

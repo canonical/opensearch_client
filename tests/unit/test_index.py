@@ -3,15 +3,12 @@
 
 """Unit tests for osclient.cli.index."""
 
-import contextlib
-import io
 import json
-from argparse import ArgumentParser
 from typing import Any
 
+from helpers import RecordingTransport, run_cli
+
 from osclient.cli import index
-from osclient.client import OpensearchClient
-from osclient.result import OpensearchResult, Success
 
 
 def test_load_documents_parses_each_format() -> None:
@@ -32,34 +29,6 @@ def test_load_documents_exits_on_bad_or_non_object_input() -> None:
             assert exit_error.code == 2
 
 
-class _RecordingTransport:
-    """Records each request and answers every one with an empty success."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, Any]] = []
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        content_type: str = "application/json",
-        timeout: int = 30,
-    ) -> OpensearchResult[Any]:
-        decoded = None if body is None else json.loads(body)
-        self.calls.append((method, path, decoded))
-        return Success({})
-
-
-def _run_cli(argv: list[str], transport: _RecordingTransport) -> None:
-    """Parse argv as an ``osclient index`` command and run it, discarding stdout."""
-    parser = ArgumentParser()
-    index.add_subparser(parser.add_subparsers(dest="subcommand"))
-    args = parser.parse_args(["index", *argv])
-    with contextlib.redirect_stdout(io.StringIO()):
-        index.run(args, OpensearchClient(transport))
-
-
 def test_rollover_is_a_dry_run_unless_applied_and_passes_settings_through() -> None:
     settings = {"index.number_of_shards": 1}
     cases: list[tuple[list[str], tuple[str, str, Any]]] = [
@@ -71,15 +40,17 @@ def test_rollover_is_a_dry_run_unless_applied_and_passes_settings_through() -> N
         ),
     ]
     for argv, expected in cases:
-        transport = _RecordingTransport()
-        _run_cli(argv, transport)
+        transport = RecordingTransport()
+        run_cli(index, "index", argv, transport)
         assert transport.calls == [expected], argv
 
 
 def test_rollover_rejects_settings_that_are_not_a_json_object() -> None:
-    transport = _RecordingTransport()
+    transport = RecordingTransport()
     try:
-        _run_cli(["rollover", "w", "--apply", "--settings", "[1]"], transport)
+        run_cli(
+            index, "index", ["rollover", "w", "--apply", "--settings", "[1]"], transport
+        )
         assert False, "expected SystemExit"
     except SystemExit as exit_error:
         assert exit_error.code == 2
