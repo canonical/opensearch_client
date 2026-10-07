@@ -15,7 +15,7 @@ The subcommands are:
 - `query`: run a SQL, PPL, or raw-DSL query
 - `search`: a term-lookup convenience
 - `index`: index-level operations
-- `cluster`: cluster-level inspection
+- `cluster`: cluster-level inspection and resource management
 - `triage`: the guided threat-hunt workflow
 
 By default, results are printed as YAML on stdout; failures are reported on
@@ -178,6 +178,13 @@ The lifecycle verbs cover the common index-management operations:
 - `delete` removes indices, and is a dry run unless `--apply`. `--index` deletes
   one concrete index, while `--pattern` deletes every matching index. The
   pattern dry run lists exactly which indices would be deleted.
+- `rollover` rolls a write alias over to a new index, and is a dry run unless
+  `--apply`: the dry run reports the new index's name without creating it.
+  `--settings SOURCE` (`@PATH`, `-`, or literal JSON) sets index settings for the
+  new index only, overriding its template, for example to give one index a
+  different shard count. Creating the index can take over 30 s on a slow
+  cluster, so the call waits up to 120 s; if it still times out, check
+  `osclient index list` before retrying, because the rollover may have happened.
 
 ```
 osclient index refresh --index hunt-001
@@ -186,6 +193,8 @@ osclient index list --pattern "triage-*"
 osclient index delete  --index hunt-001 --apply
 osclient index delete  --pattern "scratch-*"          # dry run: lists the matches
 osclient index delete  --pattern "scratch-*" --apply
+osclient index rollover logs-write                    # dry run: names the new index
+osclient index rollover logs-write --apply --settings '{"index.number_of_shards": 1}'
 ```
 
 ## `osclient cluster`
@@ -205,6 +214,36 @@ or literal).
 osclient cluster pipeline
 osclient cluster pipeline web-logs
 osclient cluster set pipeline web-logs @pipeline.json
+```
+
+`template` shows composable index templates (all, or those matching a name;
+`--legacy` shows `_template` ones instead). `set template` creates or replaces
+one from `SOURCE`, and `delete template` removes one: a dry run by default,
+reporting the index patterns it covers, until `--apply` is given. Both `delete`
+commands take exactly one name; a name with a wildcard or a comma is refused,
+because either could delete several templates. `simulate
+template` resolves what putting a definition under a name would give a new
+index, without installing it, and `simulate index` resolves what the installed
+templates would give a new index. See [Index templates](library.md#index-templates)
+for how templates interact.
+
+`component-template` shows component templates, `set component-template` creates
+or replaces one from `SOURCE`, and `delete component-template` removes one: a dry
+run by default, reporting the index templates that compose it, until `--apply`.
+Put components before the index templates that compose them, and delete them
+after.
+
+```
+osclient cluster template
+osclient cluster template wazuh --legacy
+osclient cluster simulate template web-logs @template.json   # preview before applying
+osclient cluster set template web-logs @template.json
+osclient cluster simulate index web-logs-2026.41    # verify after applying
+osclient cluster delete template web-logs           # dry run
+osclient cluster delete template web-logs --apply
+osclient cluster component-template
+osclient cluster set component-template web-fields @web-fields.json
+osclient cluster delete component-template web-fields   # dry run: lists its users
 ```
 
 ## `osclient triage`

@@ -56,6 +56,24 @@ def _temporary_indices(*names: str) -> Iterator[None]:
             _client.request("DELETE", name)
 
 
+@contextlib.contextmanager
+def _temporary_template(name: str) -> Iterator[None]:
+    """Delete the named index template on exit, whether the test passes or fails."""
+    try:
+        yield
+    finally:
+        _client.request("DELETE", f"_index_template/{name}")
+
+
+@contextlib.contextmanager
+def _temporary_component_template(name: str) -> Iterator[None]:
+    """Delete the named component template on exit, whether the test passes or fails."""
+    try:
+        yield
+    finally:
+        _client.request("DELETE", f"_component_template/{name}")
+
+
 def _unique(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
@@ -197,3 +215,106 @@ def test_bulk_reports_a_rejected_document() -> None:
         assert failures[0]["document"] == {"n": "not-an-int"}
         assert failures[0]["status"] >= 400
         assert failures[0]["error"] is not None
+
+
+def test_index_template_pins_a_field_type_before_the_first_document() -> None:
+    name = _unique("osclient-func-template")
+    index = f"{name}-2026.41"
+    event_mapping = {"properties": {"kind": {"type": "keyword"}}}
+    template = {
+        "index_patterns": [f"{name}-*"],
+        "priority": 500,
+        "template": {"mappings": {"properties": {"event": event_mapping}}},
+    }
+
+    preview = _client.simulate_template(name, template)
+    assert preview
+    assert preview.data["template"]["mappings"]["properties"]["event"] == event_mapping
+    assert _client.get_legacy_template()
+
+    with _temporary_template(name), _temporary_indices(index):
+        assert _client.put_index_template(name, template)
+        # Previewing a change to an installed template must not clash with itself.
+        assert _client.simulate_template(name, template)
+        listed = _client.get_index_template(name)
+        assert listed
+        assert [entry["name"] for entry in listed.data["index_templates"]] == [name]
+        resolved = _client.simulate_index(index)
+        assert resolved
+        properties = resolved.data["template"]["mappings"]["properties"]
+        assert properties["event"] == event_mapping
+
+        # Without the template, this first document would fix `event` as text and
+        # every later object-shaped `event` would be rejected instead.
+        scalar = _client.index_document({"event": "login:user-1"}, index=index)
+        assert not scalar
+        assert scalar.status == 400
+        assert _client.index_document({"event": {"kind": "event"}}, index=index)
+
+        assert _client.delete_index_template(name)
+        assert _client.get_index_template(name).status == 404
+
+
+def test_component_templates_compose_into_an_index_template() -> None:
+    name = _unique("osclient-func-component")
+    component = f"{name}-fields"
+    index = f"{name}-2026.41"
+    field_mapping = {"type": "keyword"}
+    template = {
+        "index_patterns": [f"{name}-*"],
+        "priority": 500,
+        "composed_of": [component],
+    }
+
+    with _temporary_template(name), _temporary_component_template(component):
+        assert _client.put_component_template(
+            component,
+            {"template": {"mappings": {"properties": {"host": field_mapping}}}},
+        )
+        listed = _client.get_component_template(component)
+        assert listed
+        assert [e["name"] for e in listed.data["component_templates"]] == [component]
+        assert _client.put_index_template(name, template)
+
+        resolved = _client.simulate_index(index)
+        assert resolved
+        assert resolved.data["template"]["mappings"]["properties"]["host"] == (
+            field_mapping
+        )
+
+        # A component still composed by an index template cannot be deleted.
+        assert not _client.delete_component_template(component)
+        assert _client.delete_index_template(name)
+        assert _client.delete_component_template(component)
+        assert _client.get_component_template(component).status == 404
+
+
+def test_rollover_dry_run_creates_nothing_and_settings_apply_to_the_new_index() -> None:
+    prefix = _unique("osclient-func-rollover")
+    alias = f"{prefix}-write"
+    first, second = f"{prefix}-000001", f"{prefix}-000002"
+    with _temporary_indices(first, second):
+        assert _client.create_index(
+            {
+                "aliases": {alias: {"is_write_index": True}},
+                "settings": {"index.number_of_shards": 2},
+            },
+            index=first,
+        )
+
+        preview = _client.rollover(alias, dry_run=True)
+        assert preview
+        assert preview.data["new_index"] == second
+        assert preview.data["rolled_over"] is False
+        assert _client.get(second).status == 404
+
+        rolled = _client.rollover(alias, settings={"index.number_of_shards": 1})
+        assert rolled
+        assert rolled.data["new_index"] == second
+        assert rolled.data["rolled_over"] is True
+        new_settings = _client.get(f"{second}/_settings")
+        assert new_settings
+        assert new_settings.data[second]["settings"]["index"]["number_of_shards"] == "1"
+        aliases = _client.get(f"_alias/{alias}")
+        assert aliases
+        assert aliases.data[second]["aliases"][alias]["is_write_index"] is True

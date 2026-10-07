@@ -14,12 +14,14 @@ from datetime import datetime, timezone
 import yaml
 
 from osclient.cli.io import (
+    emit,
     parse_json_object,
     render,
     resolve_source,
     resolve_time,
     time_range_filter,
 )
+from osclient.result import Failure
 
 
 def _args(since=None, until=None, time_field="@timestamp") -> Namespace:
@@ -62,6 +64,14 @@ def test_resolve_source_exits_with_code_2_on_an_unreadable_file() -> None:
             assert False, "expected SystemExit for a missing file"
         except SystemExit as exit_error:
             assert exit_error.code == 2
+
+
+def test_emit_exits_with_code_1_on_a_failed_result() -> None:
+    try:
+        emit(Failure("boom", status=500), "Anything", "json")
+        assert False, "expected SystemExit for a failed result"
+    except SystemExit as exit_error:
+        assert exit_error.code == 1
 
 
 def test_resolve_time() -> None:
