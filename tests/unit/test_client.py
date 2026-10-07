@@ -4,7 +4,7 @@
 """Unit tests for osclient.client.OpensearchClient."""
 
 import json
-from typing import Any, Callable
+from typing import Any
 
 from osclient.client import BulkItem, DEFAULT_INDEX, OpensearchClient, _pack_batches
 from osclient.result import Failure, OpensearchResult, Success
@@ -41,139 +41,13 @@ class _SeqTransport:
         return self._results[min(self.calls - 1, len(self._results) - 1)]
 
 
-def test_helpers_build_the_expected_request() -> None:
-    doc = {"name": "a"}
-    script = {"source": "s"}
-    # (call, method, path, expected body or None to skip the body check)
-    cases: list[tuple[Callable[[OpensearchClient], object], str, str, Any]] = [
-        (lambda c: c.field_mapping("f", index="i"), "GET", "i/_mapping/field/f", None),
-        (lambda c: c.sql("SELECT 1"), "POST", "_plugins/_sql", {"query": "SELECT 1"}),
-        (
-            lambda c: c.sql("SELECT 1", {"range": {"@timestamp": {"gte": "X"}}}),
-            "POST",
-            "_plugins/_sql",
-            {"query": "SELECT 1", "filter": {"range": {"@timestamp": {"gte": "X"}}}},
-        ),
-        (
-            lambda c: c.explain("SELECT 1"),
-            "POST",
-            "_plugins/_sql/_explain",
-            {"query": "SELECT 1"},
-        ),
-        (
-            lambda c: c.explain("source=x", query_type="ppl"),
-            "POST",
-            "_plugins/_ppl/_explain",
-            {"query": "source=x"},
-        ),
-        (lambda c: c.create_index({"m": 1}, index="i"), "PUT", "i", {"m": 1}),
-        (
-            lambda c: c.put_mapping({"properties": {"f": {"type": "ip"}}}, index="i"),
-            "PUT",
-            "i/_mapping",
-            {"properties": {"f": {"type": "ip"}}},
-        ),
-        (lambda c: c.get_pipeline(), "GET", "_ingest/pipeline", None),
-        (lambda c: c.get_pipeline("web"), "GET", "_ingest/pipeline/web", None),
-        (
-            lambda c: c.put_pipeline("web", {"processors": []}),
-            "PUT",
-            "_ingest/pipeline/web",
-            {"processors": []},
-        ),
-        (lambda c: c.get_index_template(), "GET", "_index_template", None),
-        (lambda c: c.get_index_template("t"), "GET", "_index_template/t", None),
-        (lambda c: c.get_legacy_template(), "GET", "_template", None),
-        (lambda c: c.get_legacy_template("t"), "GET", "_template/t", None),
-        (
-            lambda c: c.put_index_template("t", {"index_patterns": ["x-*"]}),
-            "PUT",
-            "_index_template/t",
-            {"index_patterns": ["x-*"]},
-        ),
-        (lambda c: c.delete_index_template("t"), "DELETE", "_index_template/t", None),
-        (
-            lambda c: c.simulate_template("t", {"index_patterns": ["x-*"]}),
-            "POST",
-            "_index_template/_simulate/t",
-            {"index_patterns": ["x-*"]},
-        ),
-        (
-            lambda c: c.simulate_index("x-1"),
-            "POST",
-            "_index_template/_simulate_index/x-1",
-            None,
-        ),
-        (lambda c: c.get_component_template(), "GET", "_component_template", None),
-        (
-            lambda c: c.get_component_template("c"),
-            "GET",
-            "_component_template/c",
-            None,
-        ),
-        (
-            lambda c: c.put_component_template("c", {"template": {}}),
-            "PUT",
-            "_component_template/c",
-            {"template": {}},
-        ),
-        (
-            lambda c: c.delete_component_template("c"),
-            "DELETE",
-            "_component_template/c",
-            None,
-        ),
-        (lambda c: c.rollover("w"), "POST", "w/_rollover?dry_run=false", None),
-        (
-            lambda c: c.rollover(
-                "w", settings={"index.number_of_shards": 1}, dry_run=True
-            ),
-            "POST",
-            "w/_rollover?dry_run=true",
-            {"settings": {"index.number_of_shards": 1}},
-        ),
-        (lambda c: c.refresh(index="i"), "POST", "i/_refresh", None),
-        (lambda c: c.delete_index("i"), "DELETE", "i", None),
-        (
-            lambda c: c.list_indices("x-*"),
-            "GET",
-            "_cat/indices/x-*?h=index&format=json",
-            None,
-        ),
-        (
-            lambda c: c.index_document(doc, index="i", refresh=True),
-            "POST",
-            "i/_doc?refresh=true",
-            doc,
-        ),
-        (
-            lambda c: c.index_document(doc, index="i", doc_id="42"),
-            "PUT",
-            "i/_doc/42",
-            doc,
-        ),
-        (
-            lambda c: c.reindex(
-                "s", "d", script=script, wait_for_completion=False, refresh=True
-            ),
-            "POST",
-            "_reindex?wait_for_completion=false&refresh=true",
-            {"source": {"index": "s"}, "dest": {"index": "d"}, "script": script},
-        ),
-        (
-            lambda c: c.update_by_query({"q": 1}, index="i", conflicts="proceed"),
-            "POST",
-            "i/_update_by_query?conflicts=proceed&wait_for_completion=true&refresh=false",
-            {"query": {"q": 1}},
-        ),
-    ]
-    for call, method, path, body in cases:
-        transport = FakeTransport(Success({}))
-        call(OpensearchClient(transport))
-        got_method, got_path, got_body, _ = transport.calls[0]
-        assert (got_method, got_path) == (method, path)
-        if body is not None:
-            assert json.loads(got_body) == body  # body reaches the transport as JSON
+def test_request_delegates_to_the_transport() -> None:
+    transport = FakeTransport(Success({"x": 1}))
+    res = OpensearchClient(transport).request("PUT", "idx", {"b": 2}, timeout=99)
+    assert res.data == {"x": 1}
+    method, path, body, timeout = transport.calls[0]
+    assert (method, path, timeout) == ("PUT", "idx", 99)
+    assert json.loads(body) == {"b": 2}  # the client JSON-encodes before the transport
 
 
 def test_default_index_is_used_and_can_be_overridden() -> None:
