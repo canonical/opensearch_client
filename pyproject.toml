@@ -23,7 +23,7 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
-opensearch_client = "opensearch_client.cli.main:main"
+os-cli = "opensearch_client.cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/opensearch_client"]

@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""``opensearch_client search``: find the newest documents matching exact FIELD=VALUE terms.
+"""``os-cli search``: find the newest documents matching exact FIELD=VALUE terms.
 
 A convenience term-lookup (not a query language): each FIELD=VALUE is an exact
 match, all ANDed, and the newest ``--count`` matches are returned most-recent
@@ -133,7 +133,7 @@ def run(args: Namespace, client: OpensearchClient) -> None:
         if unmapped:
             logging.warning(
                 "no matches: %s not mapped, so a term filter never matches them "
-                "(they may still be in _source); check `opensearch_client index mapping ...`",
+                "(they may still be in _source); check `os-cli index mapping ...`",
                 ", ".join(repr(field) for field in unmapped),
             )
     emit(diagnose(result), label, args.format)

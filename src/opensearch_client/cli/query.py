@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""``opensearch_client query``: run a query in a chosen language against the cluster.
+"""``os-cli query``: run a query in a chosen language against the cluster.
 
 One verb per invocation, each printing its result as YAML by default:
   query sql <query>   run an OpenSearch SQL query (--explain shows the plan)

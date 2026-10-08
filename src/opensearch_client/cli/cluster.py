@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""``opensearch_client cluster``: cluster-level inspection and resource management."""
+"""``os-cli cluster``: cluster-level inspection and resource management."""
 
 import logging
 import sys

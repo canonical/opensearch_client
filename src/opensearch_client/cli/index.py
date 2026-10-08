@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""``opensearch_client index``: index-level operations (mapping, bulk, lifecycle)."""
+"""``os-cli index``: index-level operations (mapping, bulk, lifecycle)."""
 
 import json
 import logging

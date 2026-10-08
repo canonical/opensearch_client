@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""The ``opensearch_client triage`` subcommand: layered triage of a copied log index.
+"""The ``os-cli triage`` subcommand: layered triage of a copied log index.
 
 Thin CLI over :mod:`opensearch_client.triage`. Builds the client from the OPENSEARCH_*
 environment variables, dispatches the chosen triage subcommand, and prints its

@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""``opensearch_client`` entrypoint: dispatches to its subcommands."""
+"""``os-cli`` entrypoint: dispatches to its subcommands."""
 
 import logging
 import sys
@@ -17,15 +17,13 @@ _COMMANDS = (query, search, index, cluster, triage_cmd)
 
 
 def main() -> None:
-    parser = ArgumentParser(
-        prog="opensearch_client", description="Query an OpenSearch cluster."
-    )
+    parser = ArgumentParser(prog="os-cli", description="Query an OpenSearch cluster.")
     parser.add_argument(
         "--insecure",
         action="store_true",
         help="skip TLS certificate verification, for a dev cluster with a "
         "self-signed cert; the equivalent of OPENSEARCH_INSECURE=1. Give it before "
-        "the subcommand: opensearch_client --insecure query sql ...",
+        "the subcommand: os-cli --insecure query sql ...",
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
     for command in _COMMANDS:
