@@ -22,7 +22,6 @@ import logging
 import os
 import socket
 import sys
-import traceback
 import uuid
 from collections import deque
 from datetime import datetime, timezone
@@ -30,6 +29,8 @@ from threading import Event, Lock, Thread, current_thread
 from typing import Any, cast
 
 from opensearch_client.client import OpensearchClient
+
+logger = logging.getLogger(__name__)
 
 # How long flush() waits for the flush thread to finish a send. Bounded so that
 # logging.shutdown cannot hang when OpenSearch is unreachable.
@@ -200,7 +201,7 @@ class ECSLogFormatter(logging.Formatter):
                     labels[safe_key] = json.dumps(value, default=str)
                 else:
                     labels[safe_key] = str(value)
-            except Exception:
+            except Exception:  # noqa: BLE001  # str() of any user object can raise
                 labels[safe_key] = "<unprintable>"
         if labels:
             fields["labels"] = labels
@@ -269,6 +270,13 @@ class OpensearchLogHandler(logging.Handler):
     :class:`ECSLogFormatter`, which lists the fields. To set the service name or
     extra fields, give the handler your own ``ECSLogFormatter`` with
     ``setFormatter``.
+
+    Attributes:
+        index: the base index name records are written to.
+        flush_threshold: flush as soon as this many records are queued.
+        buffer_limit: the most records held before the oldest are dropped.
+        flush_interval: the longest wait between flushes, in seconds.
+        dropped: the number of records discarded so far.
     """
 
     def __init__(
@@ -340,8 +348,10 @@ class OpensearchLogHandler(logging.Handler):
         return self._dropped
 
     def emit(self, record: logging.LogRecord) -> None:
-        """Queue one record for the flush thread; never block and never raise.
+        """Queue one record for the flush thread; never block, and do not raise.
 
+        A record that cannot be queued is passed to ``handleError``. Like the
+        standard library's handlers, only ``RecursionError`` is let through.
         Once ``close`` has been called, the record is counted in ``dropped``
         instead of queued.
 
@@ -362,7 +372,9 @@ class OpensearchLogHandler(logging.Handler):
                 wake = full and not self._backing_off
             if wake:
                 self._wake_event.set()
-        except Exception:
+        except RecursionError:
+            raise
+        except Exception:  # noqa: BLE001  # emit must not raise into the application
             self.handleError(record)
 
     def flush(self) -> None:
@@ -410,8 +422,8 @@ class OpensearchLogHandler(logging.Handler):
         """Send the queue on the flush thread until ``close`` is called.
 
         Sends every ``flush_interval`` seconds, when woken by a full buffer, and
-        when ``flush`` asks. A failed send never ends the loop. After ``close``
-        the loop makes one last send and exits.
+        when ``flush`` asks. A failed send is logged and never ends the loop.
+        After ``close`` the loop makes one last send and exits.
         """
         while True:
             self._wake_event.wait(self.flush_interval)
@@ -423,9 +435,9 @@ class OpensearchLogHandler(logging.Handler):
             try:
                 self._send_buffered()
             except Exception:
-                # Reported like handleError does, as there is no record to hand it.
-                if logging.raiseExceptions:
-                    traceback.print_exc()
+                # This handler ignores records logged on its own thread, so
+                # reporting here cannot feed back into the queue.
+                logger.exception("sending buffered log records failed")
             for waiter in waiters:
                 waiter.set()
             if stopping:
@@ -441,6 +453,10 @@ class OpensearchLogHandler(logging.Handler):
         reason after ``bulk``'s retries go back to the front of the queue. Records
         the cluster rejects, or that are lost to an exception, are added to
         ``dropped``.
+
+        Raises:
+            Exception: whatever ``bulk`` raises, after its documents are counted
+                as dropped.
         """
         with self._lock:
             if not self._buffer:

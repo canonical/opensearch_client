@@ -19,6 +19,8 @@ import time
 from collections.abc import Generator, Iterable
 from typing import Any, cast
 
+import pytest
+
 from opensearch_client import log_handler
 from opensearch_client.client import OpensearchClient
 from opensearch_client.log_handler import ECSLogFormatter, OpensearchLogHandler
@@ -159,6 +161,17 @@ class ThreadSpy:
         pass
 
 
+class CollectingHandler(logging.Handler):
+    """Keeps every record it receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 class ErrorRecordingHandler(OpensearchLogHandler):
     """Keeps the records passed to handleError instead of printing a traceback."""
 
@@ -217,16 +230,22 @@ def test_emit_queues_ecs_documents_and_contains_bad_records() -> None:
     try:
         raise ValueError("bad value")
     except ValueError:
-        exc_info = sys.exc_info()
-    good = logging.LogRecord(
-        "test", logging.ERROR, __file__, 1, "got %s and %d", ("text", 3), exc_info
-    )
+        good = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            __file__,
+            1,
+            "got %s and %d",
+            ("text", 3),
+            sys.exc_info(),
+        )
     bad = logging.LogRecord(
         "test", logging.INFO, __file__, 1, "%d", ("not a number",), None
     )
 
     with _close_after(handler):
         handler.emit(bad)
+        # The raise above always runs the except branch that creates good.
         handler.emit(good)
         handler.flush()
 
@@ -272,7 +291,9 @@ def test_documents_carry_identity_labels_and_merged_extra_fields() -> None:
         handler.emit(second)
         handler.flush()
 
-        first_document, second_document = client.documents
+        assert len(client.documents) == 2
+        first_document = client.documents[0]
+        second_document = client.documents[1]
         assert first_document["@timestamp"] == "2023-11-14T22:13:20.123Z"
         assert first_document["ecs"] == {"version": "9.0"}
         assert first_document["host"] == {"name": socket.gethostname()}
@@ -406,7 +427,7 @@ def test_index_is_checked_on_first_flush_and_again_only_when_it_goes_missing() -
     for index_exists, expected_calls in (index_missing, index_present):
         client = FakeClient(index_present=index_exists)
         with _close_after(_build_handler(client)) as handler:
-            assert client.calls == []
+            assert not client.calls
 
             handler.emit(_make_record("one"))
             handler.flush()
@@ -513,31 +534,60 @@ def test_temporary_failures_are_kept_and_rejected_documents_are_dropped() -> Non
             handler.flush()
 
             expected = (1, 0) if is_kept else (0, 1)  # (delivered, dropped)
-            assert (len(client.documents), handler.dropped) == expected, (
-                f"{status} {error_type}"
-            )
+            assert (
+                len(client.documents),
+                handler.dropped,
+            ) == expected, f"{status} {error_type}"
 
 
 def test_a_send_that_raises_is_contained() -> None:
     """Records are counted as dropped; the thread lives on; close does not raise."""
     client = FakeClient(bulk_error=RuntimeError("boom"))
     handler = _build_handler(client)
+    reports = CollectingHandler()
+    flush_logger = logging.getLogger("opensearch_client.log_handler")
+    # The handler is attached too: it must ignore its flush thread's own reports.
+    flush_logger.addHandler(reports)
+    flush_logger.addHandler(handler)
+    try:
+        with _close_after(handler):
+            handler.emit(_make_record("one"))
+            handler.flush()
+            assert handler.dropped == 1
 
-    with _close_after(handler):
-        handler.emit(_make_record("one"))
-        handler.flush()
-        assert handler.dropped == 1
+            handler.emit(_make_record("two"))
+            handler.flush()
+            assert handler.dropped == 2  # the flush thread survived the first failure
 
-        handler.emit(_make_record("two"))
-        handler.flush()
-        assert handler.dropped == 2  # the flush thread survived the first failure
-
-        handler.emit(_make_record("three"))
-    # Leaving the block closed the handler. Its final send raised, and that must
-    # not have escaped.
+            handler.emit(_make_record("three"))
+        # Leaving the block closed the handler. Its final send raised, and that
+        # must not have escaped.
+    finally:
+        flush_logger.removeHandler(handler)
+        flush_logger.removeHandler(reports)
 
     assert handler.dropped == 3
     assert not handler._flush_thread.is_alive()
+    # Each failed send was reported through logging, with its traceback.
+    assert len(reports.records) == 3
+    assert all(report.exc_info for report in reports.records)
+
+
+def test_emit_lets_recursion_error_through() -> None:
+    """Like the standard library's handlers, emit re-raises RecursionError."""
+
+    class Recursive:
+        def __str__(self) -> str:
+            raise RecursionError
+
+    handler = _build_handler(FakeClient(), flush_interval=3600.0)
+    record = logging.LogRecord(
+        "test", logging.INFO, __file__, 1, "%s", (Recursive(),), None
+    )
+
+    with _close_after(handler):
+        with pytest.raises(RecursionError):
+            handler.emit(record)
 
 
 def test_close_sends_the_remaining_records_and_stops_the_flush_thread() -> None:
@@ -565,4 +615,4 @@ def test_a_record_emitted_after_close_is_counted_as_dropped() -> None:
     handler.emit(_make_record("late"))
 
     assert handler.dropped == 1
-    assert client.documents == []
+    assert not client.documents
