@@ -3,16 +3,16 @@
 
 """Manage Security plugin accounts: roles, internal users and role mappings.
 
-SKELETON: every function and method below is a declaration with no behaviour yet.
+SKELETON: every function below is a declaration with no behaviour yet.
 
 This module calls the Security REST API through
 :meth:`~osclient.client.OpensearchClient.request`; the client has no methods of its
 own for it, and the API paths live here. Two parts:
 
-- The classes model the JSON of that API. Their field names are the JSON keys, and
-  the JSON shape is the one ``export_indexer_config.py`` in secops-tools writes (a
-  role, user or mapping is an object keyed by its name). ``to_dict`` builds a
-  request body; ``from_dict`` parses a response.
+- The classes model the request bodies of that API. Their field names are the JSON
+  keys (a role, user or mapping is an object keyed by its name). ``to_dict``
+  builds a request body. Responses are not parsed into these classes: the ``get_*``
+  and ``list_*`` functions return the response JSON.
 - The functions work with those classes and return
   :class:`~osclient.result.OpensearchResult`; an expected failure is a value, not
   an exception.
@@ -26,16 +26,16 @@ Rules the functions follow:
   returned by the API, and is kept out of ``repr`` and ``to_dict`` unless set.
   Nothing here generates a password.
 - Server-set fields (``reserved``, ``hidden``, ``static``, and a user's ``hash``)
-  are read from responses and never sent.
+  appear in responses and are never sent; the classes do not model them.
 - Secrets are never printed or logged. Output built from a raw API response goes
-  through :func:`redact_secrets` first, and a request body is never logged: this
-  repository's own log handler indexes what the collectors log, so a logged
-  password would end up in the SIEM index.
+  through :func:`redact_secrets` first, and a request body is never logged: logs
+  may be shipped to the cluster, and a logged password would then be stored in an
+  index.
 
-The Security API is served by the indexer's REST port (9200 by default), the
-endpoint the secops-tools scripts use, so OPENSEARCH_URL should point there.
-Whether it can also be reached through a Dashboards console proxy (the
-OPENSEARCH_DASHBOARD_URL route) has not been verified.
+The Security API is served by the cluster's REST port (9200 by default), so
+OPENSEARCH_URL should point there. Whether it can also be reached through a
+Dashboards console proxy (the OPENSEARCH_DASHBOARD_URL route) has not been
+verified.
 """
 
 from dataclasses import dataclass, field
@@ -48,6 +48,17 @@ from osclient.result import OpensearchResult
 @dataclass(frozen=True)
 class IndexPermission:
     """One entry of a role's ``index_permissions``.
+
+    Example:
+        The JSON object (``dls`` is only written when set)::
+
+            {
+              "index_patterns": ["example-index-*"],
+              "dls": "<a query, as a JSON string>",
+              "fls": ["~example_field"],
+              "masked_fields": ["example_field"],
+              "allowed_actions": ["read"]
+            }
 
     Attributes:
         index_patterns: the indexes the permissions apply to; wildcards allowed.
@@ -67,26 +78,28 @@ class IndexPermission:
         """Build this entry as the API's JSON object.
 
         Returns:
-            The entry with every field, as lists and strings.
+            The entry as lists and strings. ``dls`` is left out when empty.
         """
-        raise NotImplementedError
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "IndexPermission":
-        """Parse an ``index_permissions`` entry from the API's JSON.
-
-        Args:
-            data: the entry; the optional keys may be missing.
-
-        Returns:
-            The parsed entry.
-        """
-        raise NotImplementedError
+        body: dict[str, Any] = {"index_patterns": list(self.index_patterns)}
+        if self.dls:
+            body["dls"] = self.dls
+        body["fls"] = list(self.fls)
+        body["masked_fields"] = list(self.masked_fields)
+        body["allowed_actions"] = list(self.allowed_actions)
+        return body
 
 
 @dataclass(frozen=True)
 class TenantPermission:
     """One entry of a role's ``tenant_permissions`` (Dashboards tenants).
+
+    Example:
+        The JSON object::
+
+            {
+              "tenant_patterns": ["human_resources"],
+              "allowed_actions": ["kibana_all_read"]
+            }
 
     Attributes:
         tenant_patterns: the tenants the permissions apply to; wildcards allowed.
@@ -102,24 +115,43 @@ class TenantPermission:
         Returns:
             The entry, as lists.
         """
-        raise NotImplementedError
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TenantPermission":
-        """Parse a ``tenant_permissions`` entry from the API's JSON.
-
-        Args:
-            data: the entry.
-
-        Returns:
-            The parsed entry.
-        """
-        raise NotImplementedError
+        return {
+            "tenant_patterns": list(self.tenant_patterns),
+            "allowed_actions": list(self.allowed_actions),
+        }
 
 
 @dataclass(frozen=True)
 class Role:
     """A Security plugin role: a named set of cluster, index and tenant permissions.
+
+    Example:
+        A role as the API returns it, an object keyed by the role name (the request
+        body is the inner object)::
+
+            {
+              "example-role": {
+                "cluster_permissions": ["cluster_monitor"],
+                "index_permissions": [
+                  {
+                    "index_patterns": ["example-index-*"],
+                    "fls": [],
+                    "masked_fields": [],
+                    "allowed_actions": ["read"]
+                  }
+                ],
+                "tenant_permissions": [
+                  {
+                    "tenant_patterns": ["example-tenant"],
+                    "allowed_actions": ["kibana_all_read"]
+                  }
+                ],
+                "description": "Example role"
+              }
+            }
+
+        A response may also carry ``reserved``, ``hidden`` and ``static``, which
+        are set by the server and not modelled here.
 
     Attributes:
         name: the role name. In JSON it is the key, not a field.
@@ -127,9 +159,6 @@ class Role:
         index_permissions: index-level permissions.
         tenant_permissions: Dashboards tenant permissions.
         description: free text.
-        reserved: set by the server; a reserved role cannot be changed.
-        hidden: set by the server; a hidden role is not listed.
-        static: set by the server for built-in roles.
     """
 
     name: str
@@ -137,36 +166,46 @@ class Role:
     index_permissions: tuple[IndexPermission, ...] = ()
     tenant_permissions: tuple[TenantPermission, ...] = ()
     description: str = ""
-    reserved: bool = False
-    hidden: bool = False
-    static: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Build the request body for the roles API.
 
         Returns:
-            The permissions and description. The name and the server-set flags are
-            left out.
+            The three permission lists (empty ones included), and the description
+            when set. The name is left out: it goes in the URL.
         """
-        raise NotImplementedError
-
-    @classmethod
-    def from_dict(cls, name: str, data: dict[str, Any]) -> "Role":
-        """Parse a role from the API's JSON.
-
-        Args:
-            name: the role name (the key of the object in the response).
-            data: the role object.
-
-        Returns:
-            The parsed role, with the server-set flags filled in.
-        """
-        raise NotImplementedError
+        body: dict[str, Any] = {
+            "cluster_permissions": list(self.cluster_permissions),
+            "index_permissions": [entry.to_dict() for entry in self.index_permissions],
+            "tenant_permissions": [
+                entry.to_dict() for entry in self.tenant_permissions
+            ],
+        }
+        if self.description:
+            body["description"] = self.description
+        return body
 
 
 @dataclass(frozen=True)
 class RoleMapping:
     """Which users, backend roles and hosts receive a role.
+
+    Example:
+        A mapping as the API returns it, an object keyed by the role name (the
+        request body is the inner object)::
+
+            {
+              "example-role": {
+                "users": ["example-user"],
+                "backend_roles": ["example-backend-role"],
+                "and_backend_roles": [],
+                "hosts": ["example-host"]
+              }
+            }
+
+        A response may also carry ``description``, ``reserved``, ``hidden`` and
+        ``static``. They are not modelled: the API may not accept a description on
+        a mapping (unverified), and the rest are set by the server.
 
     Attributes:
         role: the role being mapped. In JSON it is the key, not a field.
@@ -174,10 +213,6 @@ class RoleMapping:
         backend_roles: a user with any of these receives the role.
         and_backend_roles: a user must have all of these to receive the role.
         hosts: host names or addresses; wildcards allowed.
-        description: free text.
-        reserved: set by the server; a reserved mapping cannot be changed.
-        hidden: set by the server.
-        static: set by the server for built-in mappings.
     """
 
     role: str
@@ -185,37 +220,45 @@ class RoleMapping:
     backend_roles: tuple[str, ...] = ()
     and_backend_roles: tuple[str, ...] = ()
     hosts: tuple[str, ...] = ()
-    description: str = ""
-    reserved: bool = False
-    hidden: bool = False
-    static: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Build the request body for the role mappings API.
 
         Returns:
-            The users, backend roles, and hosts. The role name and the server-set
-            flags are left out.
+            ``users``, ``backend_roles`` and ``hosts`` (empty ones included), and
+            ``and_backend_roles`` when set. The role name is left out: it goes in
+            the URL.
         """
-        raise NotImplementedError
-
-    @classmethod
-    def from_dict(cls, role: str, data: dict[str, Any]) -> "RoleMapping":
-        """Parse a role mapping from the API's JSON.
-
-        Args:
-            role: the role name (the key of the object in the response).
-            data: the mapping object.
-
-        Returns:
-            The parsed mapping.
-        """
-        raise NotImplementedError
+        body: dict[str, Any] = {
+            "users": list(self.users),
+            "backend_roles": list(self.backend_roles),
+            "hosts": list(self.hosts),
+        }
+        if self.and_backend_roles:
+            body["and_backend_roles"] = list(self.and_backend_roles)
+        return body
 
 
 @dataclass(frozen=True)
 class User:
     """An internal user of the Security plugin.
+
+    Example:
+        A user as the API returns it, an object keyed by the user name (the request
+        body is the inner object). The request body also carries a ``password``,
+        which the API never returns::
+
+            {
+              "example-user": {
+                "backend_roles": ["example-backend-role"],
+                "attributes": {"example-key": "example-value"},
+                "opendistro_security_roles": ["example-role"],
+                "description": "Example user"
+              }
+            }
+
+        A response may also carry ``hash``, ``reserved``, ``hidden`` and
+        ``static``, which are set by the server and not modelled here.
 
     Attributes:
         name: the user name. In JSON it is the key, not a field.
@@ -226,9 +269,6 @@ class User:
             already exist.
         attributes: custom name-value pairs.
         description: free text.
-        reserved: set by the server; a reserved user cannot be changed.
-        hidden: set by the server.
-        static: set by the server for built-in users.
     """
 
     name: str
@@ -237,31 +277,27 @@ class User:
     opendistro_security_roles: tuple[str, ...] = ()
     attributes: dict[str, str] = field(default_factory=dict)
     description: str = ""
-    reserved: bool = False
-    hidden: bool = False
-    static: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Build the request body for the internal users API.
 
-        Returns:
-            The roles, attributes and description, plus the password when one is
-            set. The name and the server-set flags are left out.
-        """
-        raise NotImplementedError
-
-    @classmethod
-    def from_dict(cls, name: str, data: dict[str, Any]) -> "User":
-        """Parse a user from the API's JSON.
-
-        Args:
-            name: the user name (the key of the object in the response).
-            data: the user object. Its password hash, if present, is dropped.
+        Never print or log the result: it holds the password.
 
         Returns:
-            The parsed user, without a password.
+            ``backend_roles``, ``attributes`` and ``opendistro_security_roles``
+            (empty ones included), the description when set, and the password when
+            set. The name is left out: it goes in the URL.
         """
-        raise NotImplementedError
+        body: dict[str, Any] = {
+            "backend_roles": list(self.backend_roles),
+            "attributes": dict(self.attributes),
+            "opendistro_security_roles": list(self.opendistro_security_roles),
+        }
+        if self.description:
+            body["description"] = self.description
+        if self.password:
+            body["password"] = self.password
+        return body
 
 
 _ROLES_PATH = "_plugins/_security/api/roles"
@@ -273,9 +309,8 @@ REDACTED = "<redacted>"
 # Keys whose values must never be printed or logged, wherever they appear in a
 # response:
 # - password: write-only; the API never returns it, but a request body carries it.
-# - hash: the stored password hash. The API normally returns it empty, but the
-#   secops-tools scripts strip it on import, which suggests exports can contain it,
-#   and a hash can be attacked offline.
+# - hash: the stored password hash. The API normally returns it empty, but a
+#   response could contain one, and a hash can be attacked offline.
 # Not redacted, but worth a decision: a user's ``attributes`` are free-form
 # name-value pairs and could hold anything.
 SENSITIVE_KEYS = frozenset({"password", "hash"})
@@ -384,7 +419,7 @@ def check_service_account(
 # -- read ---------------------------------------------------------------------
 
 
-def get_role(client: OpensearchClient, name: str) -> OpensearchResult[Role]:
+def get_role(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, Any]]:
     """Get one role.
 
     Args:
@@ -392,27 +427,30 @@ def get_role(client: OpensearchClient, name: str) -> OpensearchResult[Role]:
         name: the role name.
 
     Returns:
-        The role, or a failure (status 404 when it does not exist).
+        The response JSON, an object keyed by the role name, as the API returns it;
+        or a failure (status 404 when it does not exist).
     """
     raise NotImplementedError
 
 
-def get_user(client: OpensearchClient, name: str) -> OpensearchResult[User]:
-    """Get one internal user, without a password.
+def get_user(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, Any]]:
+    """Get one internal user.
 
     Args:
         client: the client used to reach the cluster.
         name: the user name.
 
     Returns:
-        The user, or a failure (status 404 when it does not exist).
+        The response JSON, an object keyed by the user name, as the API returns it;
+        or a failure (status 404 when it does not exist). It is not redacted: pass
+        it through :func:`redact_secrets` before printing.
     """
     raise NotImplementedError
 
 
 def get_role_mapping(
     client: OpensearchClient, role: str
-) -> OpensearchResult[RoleMapping]:
+) -> OpensearchResult[dict[str, Any]]:
     """Get the mapping of one role.
 
     Args:
@@ -420,45 +458,45 @@ def get_role_mapping(
         role: the role name.
 
     Returns:
-        The mapping, or a failure (status 404 when the role has none).
+        The response JSON, an object keyed by the role name, as the API returns it;
+        or a failure (status 404 when the role has none).
     """
     raise NotImplementedError
 
 
-def list_roles(client: OpensearchClient) -> OpensearchResult[list[Role]]:
-    """List every role the API returns, sorted by name.
+def list_roles(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
+    """List every role the API returns.
 
     Args:
         client: the client used to reach the cluster.
 
     Returns:
-        The roles.
+        The response JSON, an object keyed by role name, as the API returns it.
     """
     raise NotImplementedError
 
 
-def list_users(client: OpensearchClient) -> OpensearchResult[list[User]]:
-    """List every internal user the API returns, sorted by name, without passwords.
+def list_users(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
+    """List every internal user the API returns.
 
     Args:
         client: the client used to reach the cluster.
 
     Returns:
-        The users.
+        The response JSON, an object keyed by user name, as the API returns it. It
+        is not redacted: pass it through :func:`redact_secrets` before printing.
     """
     raise NotImplementedError
 
 
-def list_role_mappings(
-    client: OpensearchClient,
-) -> OpensearchResult[list[RoleMapping]]:
-    """List every role mapping the API returns, sorted by role name.
+def list_role_mappings(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
+    """List every role mapping the API returns.
 
     Args:
         client: the client used to reach the cluster.
 
     Returns:
-        The mappings.
+        The response JSON, an object keyed by role name, as the API returns it.
     """
     raise NotImplementedError
 
