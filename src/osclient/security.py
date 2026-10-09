@@ -40,9 +40,10 @@ verified.
 
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 from osclient.client import OpensearchClient
-from osclient.result import OpensearchResult
+from osclient.result import OpensearchResult, Success
 
 
 @dataclass(frozen=True)
@@ -304,6 +305,15 @@ _ROLES_PATH = "_plugins/_security/api/roles"
 _USERS_PATH = "_plugins/_security/api/internalusers"
 _ROLE_MAPPINGS_PATH = "_plugins/_security/api/rolesmapping"
 
+
+def _path(base: str, name: str) -> str:
+    """Build the API path of one named object, encoding the name.
+
+    Encoding keeps a ``/`` or ``?`` in a name from changing which endpoint is hit.
+    """
+    return f"{base}/{quote(name, safe='')}"
+
+
 REDACTED = "<redacted>"
 
 # Keys whose values must never be printed or logged, wherever they appear in a
@@ -358,6 +368,15 @@ def build_logging_writer_role(name: str, index_patterns: tuple[str, ...]) -> Rol
 # -- existence ----------------------------------------------------------------
 
 
+def _exists(lookup: OpensearchResult[dict[str, Any]]) -> OpensearchResult[bool]:
+    """Turn the result of a ``get_*`` call into whether the object exists."""
+    if lookup:
+        return Success(True)
+    if lookup.status == 404:
+        return Success(False)
+    return lookup
+
+
 def role_exists(client: OpensearchClient, name: str) -> OpensearchResult[bool]:
     """Report whether a role exists.
 
@@ -369,7 +388,7 @@ def role_exists(client: OpensearchClient, name: str) -> OpensearchResult[bool]:
         True or False; a failure other than "not found" (such as an
         authorization error) is returned as a failure, not as False.
     """
-    raise NotImplementedError
+    return _exists(get_role(client, name))
 
 
 def user_exists(client: OpensearchClient, name: str) -> OpensearchResult[bool]:
@@ -382,7 +401,7 @@ def user_exists(client: OpensearchClient, name: str) -> OpensearchResult[bool]:
     Returns:
         True or False; any other failure is returned as a failure.
     """
-    raise NotImplementedError
+    return _exists(get_user(client, name))
 
 
 def role_mapping_exists(client: OpensearchClient, role: str) -> OpensearchResult[bool]:
@@ -395,7 +414,7 @@ def role_mapping_exists(client: OpensearchClient, role: str) -> OpensearchResult
     Returns:
         True or False; any other failure is returned as a failure.
     """
-    raise NotImplementedError
+    return _exists(get_role_mapping(client, role))
 
 
 def check_service_account(
@@ -430,7 +449,7 @@ def get_role(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, 
         The response JSON, an object keyed by the role name, as the API returns it;
         or a failure (status 404 when it does not exist).
     """
-    raise NotImplementedError
+    return client.request("GET", _path(_ROLES_PATH, name))
 
 
 def get_user(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, Any]]:
@@ -445,7 +464,7 @@ def get_user(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, 
         or a failure (status 404 when it does not exist). It is not redacted: pass
         it through :func:`redact_secrets` before printing.
     """
-    raise NotImplementedError
+    return client.request("GET", _path(_USERS_PATH, name))
 
 
 def get_role_mapping(
@@ -461,7 +480,7 @@ def get_role_mapping(
         The response JSON, an object keyed by the role name, as the API returns it;
         or a failure (status 404 when the role has none).
     """
-    raise NotImplementedError
+    return client.request("GET", _path(_ROLE_MAPPINGS_PATH, role))
 
 
 def list_roles(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
@@ -473,7 +492,7 @@ def list_roles(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
     Returns:
         The response JSON, an object keyed by role name, as the API returns it.
     """
-    raise NotImplementedError
+    return client.request("GET", _ROLES_PATH)
 
 
 def list_users(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
@@ -486,7 +505,7 @@ def list_users(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
         The response JSON, an object keyed by user name, as the API returns it. It
         is not redacted: pass it through :func:`redact_secrets` before printing.
     """
-    raise NotImplementedError
+    return client.request("GET", _USERS_PATH)
 
 
 def list_role_mappings(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
@@ -498,7 +517,7 @@ def list_role_mappings(client: OpensearchClient) -> OpensearchResult[dict[str, A
     Returns:
         The response JSON, an object keyed by role name, as the API returns it.
     """
-    raise NotImplementedError
+    return client.request("GET", _ROLE_MAPPINGS_PATH)
 
 
 # -- create (create-only) -----------------------------------------------------
