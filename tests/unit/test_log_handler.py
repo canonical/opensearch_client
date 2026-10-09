@@ -593,7 +593,7 @@ def test_emit_lets_recursion_error_through() -> None:
 
 
 def test_close_sends_the_remaining_records_and_stops_the_flush_thread() -> None:
-    """Closing flushes what is queued; a later flush returns at once."""
+    """Closing flushes what is queued and waits as long as bulk's retries can take."""
     client = FakeClient()
     handler = _build_handler(client)
     handler.emit(_make_record("last"))
@@ -607,10 +607,8 @@ def test_close_sends_the_remaining_records_and_stops_the_flush_thread() -> None:
     handler.flush()  # logging.shutdown flushes handlers that were already closed
     assert time.monotonic() - started < _WAIT_SECONDS
 
-
-def test_close_waits_as_long_as_a_send_with_all_its_retries_can_take() -> None:
-    """The wait follows bulk's own retries and delays, not a separate number."""
-
+    # The wait for a final send follows bulk's own retries and delays, not a
+    # separate number: run a real bulk against a cluster that is down.
     class AlwaysDown:
         """A transport on which every request fails."""
 
