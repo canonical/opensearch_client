@@ -422,13 +422,44 @@ def check_service_account(
         client: the client used to reach the cluster.
         user: the user name.
         role: the role name; its mapping is checked too.
-        index: the index the account writes to.
+        index: the one index the account writes to, by exact name.
 
     Returns:
         A mapping with the keys ``user``, ``role``, ``role_mapping`` and
-        ``index``, each True or False.
+        ``index``, each True or False; or the first failure met (an authorization
+        error, say), in which case the later parts are not looked up. A user or
+        role name refused as in :func:`get_role`, or an index name that could match
+        more than one index, fails without a request. For the index that means a
+        name that is blank, ``.``, ``..`` or starts with ``_`` (an API endpoint, or
+        ``_all``), or contains ``*``, ``?`` or ``,``: a lookup of such a name would
+        succeed whenever any index, or any endpoint, matched.
     """
-    raise NotImplementedError
+    for invalid in (_invalid_name("user", user), _invalid_name("role", role)):
+        if invalid is not None:
+            return invalid
+    if (
+        _invalid_name("index", index) is not None
+        or index.startswith("_")
+        or any(char in index for char in "*?,")
+    ):
+        return Failure(
+            f"index name {index!r} is not valid: it must name one index, so not "
+            "blank, '.', '..', starting with '_', or containing '*', '?' or ','"
+        )
+
+    lookups: list[tuple[str, Callable[[], OpensearchResult[bool]]]] = [
+        ("user", lambda: user_exists(client, user)),
+        ("role", lambda: role_exists(client, role)),
+        ("role_mapping", lambda: role_mapping_exists(client, role)),
+        ("index", lambda: client.index_exists(quote(index, safe=""))),
+    ]
+    found: dict[str, bool] = {}
+    for part, lookup in lookups:
+        outcome = lookup()
+        if not outcome:
+            return outcome
+        found[part] = outcome.data
+    return Success(found)
 
 
 # -- read ---------------------------------------------------------------------
@@ -697,11 +728,17 @@ def delete_role(
         name: the role name.
 
     Returns:
-        The API's acknowledgement, or a failure.
+        The API's acknowledgement, or a failure (the API's own, such as a 404 for a
+        role that does not exist or a refusal for a reserved one, is returned
+        unchanged). A blank name, ``.`` or ``..`` is refused without a request.
+        The role's mapping is not deleted with it.
 
     API: https://docs.opensearch.org/latest/security/api/roles/delete-role/
     """
-    raise NotImplementedError
+    invalid = _invalid_name("role", name)
+    if invalid is not None:
+        return invalid
+    return client.request("DELETE", _path(_ROLES_PATH, name))
 
 
 def delete_user(
@@ -714,11 +751,17 @@ def delete_user(
         name: the user name.
 
     Returns:
-        The API's acknowledgement, or a failure.
+        The API's acknowledgement, or a failure (the API's own, such as a 404 for a
+        user that does not exist or a refusal for a reserved one, is returned
+        unchanged). A blank name, ``.`` or ``..`` is refused without a request.
+        Mappings that name the user are not changed.
 
     API: https://docs.opensearch.org/latest/security/api/users/delete-user/
     """
-    raise NotImplementedError
+    invalid = _invalid_name("user", name)
+    if invalid is not None:
+        return invalid
+    return client.request("DELETE", _path(_USERS_PATH, name))
 
 
 def delete_role_mapping(
@@ -731,8 +774,13 @@ def delete_role_mapping(
         role: the role name.
 
     Returns:
-        The API's acknowledgement, or a failure.
+        The API's acknowledgement, or a failure (the API's own, such as a 404 for a
+        role with no mapping, is returned unchanged). A blank name, ``.`` or ``..``
+        is refused without a request. The role itself is not deleted.
 
     API: https://docs.opensearch.org/latest/security/api/role-mappings/delete-role-mapping/
     """
-    raise NotImplementedError
+    invalid = _invalid_name("role", role)
+    if invalid is not None:
+        return invalid
+    return client.request("DELETE", _path(_ROLE_MAPPINGS_PATH, role))

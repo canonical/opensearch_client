@@ -126,6 +126,9 @@ def test_a_name_that_would_not_address_one_object_is_refused_without_a_request()
         security.role_exists,
         security.user_exists,
         security.role_mapping_exists,
+        security.delete_role,
+        security.delete_user,
+        security.delete_role_mapping,
     ]
 
     for blank_or_dot in ("", "   ", ".", ".."):
@@ -300,3 +303,104 @@ def test_create_service_account_reports_what_was_created_before_a_failure() -> N
     assert result.data == {"created": ["role"]}
     assert len(transport.calls) == 3
     assert "a-secret-value" not in result.reason
+
+
+def test_delete_sends_one_delete_and_returns_the_api_answer_unchanged() -> None:
+    acknowledgement = {"status": "OK", "message": "'example' deleted."}
+    transport = RecordingTransport(acknowledgement)
+    client = OpensearchClient(transport)
+
+    deleted = [
+        security.delete_role(client, "example-role"),
+        security.delete_user(client, "example-user"),
+        security.delete_role_mapping(client, "example-role"),
+    ]
+
+    for result in deleted:
+        assert result == Success(acknowledgement)
+    assert transport.calls == [
+        ("DELETE", "_plugins/_security/api/roles/example-role", None),
+        ("DELETE", "_plugins/_security/api/internalusers/example-user", None),
+        ("DELETE", "_plugins/_security/api/rolesmapping/example-role", None),
+    ]
+
+    # A failure, such as a 404 or a refusal to delete a reserved object, is the
+    # API's answer and is returned as it is.
+    missing = Failure("404 from DELETE", status=404)
+    for delete in (
+        security.delete_role,
+        security.delete_user,
+        security.delete_role_mapping,
+    ):
+        transport = ScriptedTransport([missing])
+        assert delete(OpensearchClient(transport), "example") == missing
+
+
+def test_check_service_account_reports_each_part() -> None:
+    present = Success({"example": {}})
+    absent = Failure("404 from GET", status=404)
+
+    everything = ScriptedTransport([present, present, present, present])
+    result = security.check_service_account(
+        OpensearchClient(everything), "example-user", "example-role", "example-logs"
+    )
+    assert result == Success(
+        {"user": True, "role": True, "role_mapping": True, "index": True}
+    )
+    assert everything.calls == [
+        ("GET", "_plugins/_security/api/internalusers/example-user", None),
+        ("GET", "_plugins/_security/api/roles/example-role", None),
+        ("GET", "_plugins/_security/api/rolesmapping/example-role", None),
+        ("GET", "example-logs", None),
+    ]
+
+    # Only the index exists, as before an account is created.
+    only_index = ScriptedTransport([absent, absent, absent, present])
+    result = security.check_service_account(
+        OpensearchClient(only_index), "example-user", "example-role", "example-logs"
+    )
+    assert result == Success(
+        {"user": False, "role": False, "role_mapping": False, "index": True}
+    )
+
+
+def test_check_service_account_returns_the_first_failure_and_stops() -> None:
+    forbidden = Failure("403 from GET", status=403)
+    transport = ScriptedTransport([Success({"example": {}}), forbidden])
+
+    result = security.check_service_account(
+        OpensearchClient(transport), "example-user", "example-role", "example-logs"
+    )
+
+    assert result == forbidden
+    assert len(transport.calls) == 2
+
+
+def test_check_service_account_refuses_input_that_would_not_name_one_object() -> None:
+    refused = [
+        ("", "example-role", "example-logs"),
+        ("example-user", "..", "example-logs"),
+        ("example-user", "example-role", ""),
+        ("example-user", "example-role", ".."),
+        ("example-user", "example-role", "_all"),
+        ("example-user", "example-role", "_cluster"),
+        ("example-user", "example-role", "example-*"),
+        ("example-user", "example-role", "example-?"),
+        ("example-user", "example-role", "one,two"),
+    ]
+
+    for user, role, index in refused:
+        transport = RecordingTransport()
+        result = security.check_service_account(
+            OpensearchClient(transport), user, role, index
+        )
+        assert not result
+        assert "is not valid" in result.reason
+        assert transport.calls == []
+
+    # An index name is encoded, so it cannot change the endpoint.
+    transport = RecordingTransport()
+    security.check_service_account(
+        OpensearchClient(transport), "example-user", "example-role", "a/b c"
+    )
+    assert transport.calls[-1] == ("GET", "a%2Fb%20c", None)
