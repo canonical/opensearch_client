@@ -3,11 +3,14 @@
 
 """Unit tests for the request-body classes in osclient.security."""
 
+from collections.abc import Callable
+from typing import Any
+
 from helpers import RecordingTransport, ScriptedTransport
 
 from osclient import security
 from osclient.client import OpensearchClient
-from osclient.result import Failure, Success
+from osclient.result import Failure, OpensearchResult, Success
 from osclient.security import (
     IndexPermission,
     Role,
@@ -166,3 +169,98 @@ def test_existence_checks_report_true_false_or_the_failure() -> None:
 
         denied = ScriptedTransport([forbidden])
         assert exists(OpensearchClient(denied), "example") == forbidden
+
+
+def test_create_puts_only_when_the_object_is_absent() -> None:
+    role = Role(name="example-role", cluster_permissions=("cluster_monitor",))
+    user = User(name="example-user", password="a-secret-value")
+    mapping = RoleMapping(role="example-role", users=("example-user",))
+    cases: list[
+        tuple[
+            Callable[[OpensearchClient], OpensearchResult[dict[str, Any]]],
+            str,
+            dict[str, Any],
+        ]
+    ] = [
+        (
+            lambda client: security.create_role(client, role),
+            "_plugins/_security/api/roles/example-role",
+            role.to_dict(),
+        ),
+        (
+            lambda client: security.create_user(client, user),
+            "_plugins/_security/api/internalusers/example-user",
+            user.to_dict(),
+        ),
+        (
+            lambda client: security.create_role_mapping(client, mapping),
+            "_plugins/_security/api/rolesmapping/example-role",
+            mapping.to_dict(),
+        ),
+    ]
+    acknowledgement = {"status": "CREATED"}
+    forbidden = Failure("403 from GET", status=403)
+
+    for create, path, body in cases:
+        # Absent: the check finds nothing, then the object is sent.
+        absent = ScriptedTransport(
+            [Failure("404 from GET", status=404), Success(acknowledgement)]
+        )
+        assert create(OpensearchClient(absent)) == Success(acknowledgement)
+        assert absent.calls == [("GET", path, None), ("PUT", path, body)]
+
+        # Present: a 409 failure, and nothing is sent.
+        present = ScriptedTransport([Success({"example": {}})])
+        refused = create(OpensearchClient(present))
+        assert not refused
+        assert refused.status == 409
+        assert present.calls == [("GET", path, None)]
+
+        # A check that fails for another reason is returned, and nothing is sent.
+        unchecked = ScriptedTransport([forbidden])
+        assert create(OpensearchClient(unchecked)) == forbidden
+        assert unchecked.calls == [("GET", path, None)]
+
+
+def test_a_name_that_would_not_address_one_object_is_refused_without_a_request() -> (
+    None
+):
+    calls: list[Callable[[OpensearchClient, str], OpensearchResult[Any]]] = [
+        security.get_role,
+        security.get_user,
+        security.get_role_mapping,
+        security.role_exists,
+        security.user_exists,
+        security.role_mapping_exists,
+        lambda client, name: security.create_role(client, Role(name=name)),
+        lambda client, name: security.create_user(
+            client, User(name=name, password="a-secret-value")
+        ),
+        lambda client, name: security.create_role_mapping(client, RoleMapping(name)),
+    ]
+
+    for blank_or_dot in ("", "   ", ".", ".."):
+        for call in calls:
+            transport = RecordingTransport()
+            result = call(OpensearchClient(transport), blank_or_dot)
+            assert not result
+            assert "is not valid" in result.reason
+            assert transport.calls == []
+
+    # A name that merely starts with a dot is fine.
+    transport = RecordingTransport()
+    assert security.get_role(OpensearchClient(transport), ".hidden-role")
+    assert len(transport.calls) == 1
+
+
+def test_create_user_refuses_an_empty_password_without_a_request() -> None:
+    transport = RecordingTransport()
+
+    result = security.create_user(
+        OpensearchClient(transport), User(name="example-user")
+    )
+
+    assert not result
+    assert "example-user" in result.reason
+    assert "needs a password" in result.reason
+    assert transport.calls == []

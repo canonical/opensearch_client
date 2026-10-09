@@ -43,7 +43,7 @@ from typing import Any
 from urllib.parse import quote
 
 from osclient.client import OpensearchClient
-from osclient.result import OpensearchResult, Success
+from osclient.result import Failure, OpensearchResult, Success
 
 
 @dataclass(frozen=True)
@@ -314,6 +314,27 @@ def _path(base: str, name: str) -> str:
     return f"{base}/{quote(name, safe='')}"
 
 
+def _invalid_name(kind: str, name: str) -> Failure | None:
+    """Refuse a name that would not address one object.
+
+    A blank name makes the path the collection's, so a lookup would list every
+    object. ``.`` and ``..`` are dot segments, which an HTTP client may resolve to
+    another endpoint even though they are not encoded.
+
+    Args:
+        kind: what the name is of (``role``, ``user``), for the failure message.
+        name: the name to check.
+
+    Returns:
+        A failure to return as it is, or None if the name is fine.
+    """
+    if not name.strip() or name in (".", ".."):
+        return Failure(
+            f"{kind} name {name!r} is not valid: it must not be blank, '.' or '..'"
+        )
+    return None
+
+
 REDACTED = "<redacted>"
 
 # Keys whose values must never be printed or logged, wherever they appear in a
@@ -386,7 +407,8 @@ def role_exists(client: OpensearchClient, name: str) -> OpensearchResult[bool]:
 
     Returns:
         True or False; a failure other than "not found" (such as an
-        authorization error) is returned as a failure, not as False.
+        authorization error, or a name refused as in :func:`get_role`) is returned
+        as a failure, not as False.
     """
     return _exists(get_role(client, name))
 
@@ -447,8 +469,12 @@ def get_role(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, 
 
     Returns:
         The response JSON, an object keyed by the role name, as the API returns it;
-        or a failure (status 404 when it does not exist).
+        or a failure (status 404 when it does not exist). A blank name, ``.`` or
+        ``..`` is refused without a request.
     """
+    invalid = _invalid_name("role", name)
+    if invalid is not None:
+        return invalid
     return client.request("GET", _path(_ROLES_PATH, name))
 
 
@@ -461,9 +487,13 @@ def get_user(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, 
 
     Returns:
         The response JSON, an object keyed by the user name, as the API returns it;
-        or a failure (status 404 when it does not exist). It is not redacted: pass
-        it through :func:`redact_secrets` before printing.
+        or a failure (status 404 when it does not exist). A blank name, ``.`` or
+        ``..`` is refused without a request. It is not redacted: pass it through
+        :func:`redact_secrets` before printing.
     """
+    invalid = _invalid_name("user", name)
+    if invalid is not None:
+        return invalid
     return client.request("GET", _path(_USERS_PATH, name))
 
 
@@ -478,8 +508,12 @@ def get_role_mapping(
 
     Returns:
         The response JSON, an object keyed by the role name, as the API returns it;
-        or a failure (status 404 when the role has none).
+        or a failure (status 404 when the role has none). A blank name, ``.`` or
+        ``..`` is refused without a request.
     """
+    invalid = _invalid_name("role", role)
+    if invalid is not None:
+        return invalid
     return client.request("GET", _path(_ROLE_MAPPINGS_PATH, role))
 
 
@@ -523,6 +557,36 @@ def list_role_mappings(client: OpensearchClient) -> OpensearchResult[dict[str, A
 # -- create (create-only) -----------------------------------------------------
 
 
+def _create_only(
+    client: OpensearchClient,
+    lookup: OpensearchResult[bool],
+    description: str,
+    path: str,
+    body: dict[str, Any],
+) -> OpensearchResult[dict[str, Any]]:
+    """PUT ``body`` to ``path`` unless the object is already there.
+
+    The check and the PUT are two requests, so another writer could create the
+    object in between. The Security API has no conditional PUT.
+
+    Args:
+        client: the client used to reach the cluster.
+        lookup: the result of the existence check made just before.
+        description: what is being created, for the failure message.
+        path: the object's API path.
+        body: the request body; never logged, since it may hold a password.
+
+    Returns:
+        The API's acknowledgement; the failed check if it failed; or a failure with
+        status 409 if the object exists.
+    """
+    if not lookup:
+        return lookup
+    if lookup.data:
+        return Failure(f"{description} already exists", status=409)
+    return client.request("PUT", path, body)
+
+
 def create_role(
     client: OpensearchClient, role: Role
 ) -> OpensearchResult[dict[str, Any]]:
@@ -534,9 +598,16 @@ def create_role(
 
     Returns:
         The API's acknowledgement, or a failure. A role that already exists is a
-        failure (status 409) and is left unchanged.
+        failure (status 409) and is left unchanged. A name refused as in
+        :func:`get_role` fails without a request.
     """
-    raise NotImplementedError
+    return _create_only(
+        client,
+        role_exists(client, role.name),
+        f"role {role.name!r}",
+        _path(_ROLES_PATH, role.name),
+        role.to_dict(),
+    )
 
 
 def create_user(
@@ -550,9 +621,23 @@ def create_user(
 
     Returns:
         The API's acknowledgement, or a failure. A user that already exists is a
-        failure (status 409) and keeps its password.
+        failure (status 409) and keeps its password. A name refused as in
+        :func:`get_user`, or an empty password, fails without a request: the
+        server would reject a user without a password anyway, but only after the
+        existence check.
     """
-    raise NotImplementedError
+    invalid = _invalid_name("user", user.name)
+    if invalid is not None:
+        return invalid
+    if not user.password:
+        return Failure(f"user {user.name!r} needs a password")
+    return _create_only(
+        client,
+        user_exists(client, user.name),
+        f"user {user.name!r}",
+        _path(_USERS_PATH, user.name),
+        user.to_dict(),
+    )
 
 
 def create_role_mapping(
@@ -566,9 +651,16 @@ def create_role_mapping(
 
     Returns:
         The API's acknowledgement, or a failure. A role that already has a mapping
-        is a failure (status 409) and keeps it.
+        is a failure (status 409) and keeps it. A role name refused as in
+        :func:`get_role_mapping` fails without a request.
     """
-    raise NotImplementedError
+    return _create_only(
+        client,
+        role_mapping_exists(client, mapping.role),
+        f"mapping of role {mapping.role!r}",
+        _path(_ROLE_MAPPINGS_PATH, mapping.role),
+        mapping.to_dict(),
+    )
 
 
 def create_service_account(
