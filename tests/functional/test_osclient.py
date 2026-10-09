@@ -379,10 +379,11 @@ def test_service_accounts_are_created_fetched_used_and_deleted() -> None:
     reader_password = _password()
 
     # A write-only account for shipping logs, and a read-only one for querying them.
-    writer = security.build_logging_writer_role(writer_role, (index,))
+    built_writer = security.build_logging_writer_role(writer_role, (index,))
+    assert built_writer, built_writer.reason
+    writer = built_writer.data
     reader = security.Role(
-        name=reader_role,
-        index_permissions=(security.IndexPermission((index,), ("read",)),),
+        name=reader_role, index_patterns=(index,), index_actions=("read",)
     )
     names = ((writer_user, writer_role), (reader_user, reader_role))
     accounts = (

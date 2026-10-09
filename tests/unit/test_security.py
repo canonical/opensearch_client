@@ -1,117 +1,82 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Unit tests for the request-body classes in osclient.security."""
+"""Unit tests for osclient.security."""
 
+import re
 from collections.abc import Callable
 from typing import Any
 
+import pytest
 from helpers import RecordingTransport, ScriptedTransport
 
 from osclient import security
 from osclient.client import OpensearchClient
 from osclient.result import Failure, OpensearchResult, Success
-from osclient.security import (
-    IndexPermission,
-    Role,
-    RoleMapping,
-    TenantPermission,
-    User,
-)
+from osclient.security import Role, RoleMapping, User
 
 
-def test_a_minimal_role_mapping_and_user_are_rebuilt_exactly() -> None:
+def test_the_request_bodies_hold_only_what_the_api_needs() -> None:
     role = Role(
         name="example-role",
         cluster_permissions=("cluster_monitor",),
-        index_permissions=(
-            IndexPermission(
-                index_patterns=("example-index-*",), allowed_actions=("read",)
-            ),
-        ),
+        index_patterns=("example-index-*",),
+        index_actions=("read",),
     )
     assert role.to_dict() == {
         "cluster_permissions": ["cluster_monitor"],
         "index_permissions": [
-            {
-                "index_patterns": ["example-index-*"],
-                "fls": [],
-                "masked_fields": [],
-                "allowed_actions": ["read"],
-            }
+            {"index_patterns": ["example-index-*"], "allowed_actions": ["read"]}
         ],
-        "tenant_permissions": [],
     }
 
-    mapping = RoleMapping(role="example-role", users=("example-user",))
-    assert mapping.to_dict() == {
-        "users": ["example-user"],
-        "backend_roles": [],
-        "hosts": [],
+    # No index patterns means no index permissions entry at all.
+    assert Role(name="example-role").to_dict() == {
+        "cluster_permissions": [],
+        "index_permissions": [],
     }
 
-    user = User(name="example-user", description="Example user")
-    assert user.to_dict() == {
-        "backend_roles": [],
-        "attributes": {},
-        "opendistro_security_roles": [],
-        "description": "Example user",
-    }
+    mapping = RoleMapping(role="example-role", users=("example-user", "other-user"))
+    assert mapping.to_dict() == {"users": ["example-user", "other-user"]}
 
-
-def test_a_role_with_every_field_is_rebuilt_exactly() -> None:
-    role = Role(
-        name="example-role",
-        cluster_permissions=("cluster_monitor",),
-        index_permissions=(
-            IndexPermission(
-                index_patterns=("example-index-*",),
-                allowed_actions=("read",),
-                dls='{"term": {"owner": "example"}}',
-                fls=("~example_field",),
-                masked_fields=("other_field",),
-            ),
-        ),
-        tenant_permissions=(
-            TenantPermission(("example-tenant",), ("kibana_all_read",)),
-        ),
-        description="Example role",
-    )
-
-    assert role.to_dict() == {
-        "cluster_permissions": ["cluster_monitor"],
-        "index_permissions": [
-            {
-                "index_patterns": ["example-index-*"],
-                "dls": '{"term": {"owner": "example"}}',
-                "fls": ["~example_field"],
-                "masked_fields": ["other_field"],
-                "allowed_actions": ["read"],
-            }
-        ],
-        "tenant_permissions": [
-            {
-                "tenant_patterns": ["example-tenant"],
-                "allowed_actions": ["kibana_all_read"],
-            }
-        ],
-        "description": "Example role",
-    }
-
-
-def test_a_password_is_write_only() -> None:
     user = User(name="example-user", password="a-secret-value")
-
-    assert user.to_dict()["password"] == "a-secret-value"
-    assert "password" not in User(name="example-user").to_dict()
+    assert user.to_dict() == {"password": "a-secret-value"}
     assert "a-secret-value" not in repr(user)
 
 
-def test_and_backend_roles_are_sent_only_when_set() -> None:
-    mapping = RoleMapping(role="r", users=("u",), and_backend_roles=("a", "b"))
+def test_an_invalid_object_cannot_be_created() -> None:
+    refused: list[tuple[Callable[[], object], str]] = [
+        (lambda: Role(name=""), "role name '' is not valid"),
+        (lambda: Role(name=".."), "role name '..' is not valid"),
+        (
+            lambda: Role(name="r", index_patterns=("a",)),
+            "index_patterns and index_actions must be given together",
+        ),
+        (
+            lambda: Role(name="r", index_actions=("read",)),
+            "index_patterns and index_actions must be given together",
+        ),
+        (
+            lambda: Role(name="r", index_patterns=("  ",), index_actions=("read",)),
+            "is blank",
+        ),
+        (lambda: Role(name="r", cluster_permissions=("",)), "is blank"),
+        (lambda: RoleMapping(role=" ", users=("u",)), "role name ' ' is not valid"),
+        (lambda: RoleMapping(role="r", users=()), "needs at least one user"),
+        (lambda: RoleMapping(role="r", users=("",)), "user name '' is not valid"),
+        (lambda: RoleMapping(role="r", users=("a*",)), "must not contain"),
+        (lambda: User(name="", password="a-secret-value"), "user name '' is not valid"),
+        (lambda: User(name="a?", password="a-secret-value"), "must not contain"),
+        (lambda: User(name="example-user", password=""), "needs a password"),
+    ]
 
-    assert mapping.to_dict()["and_backend_roles"] == ["a", "b"]
-    assert "and_backend_roles" not in RoleMapping(role="r", users=("u",)).to_dict()
+    for create, expected in refused:
+        with pytest.raises(ValueError, match=re.escape(expected)) as caught:
+            create()
+        assert "a-secret-value" not in str(caught.value)
+
+    # A role with no permissions at all is valid, and so is a pattern with a dot.
+    assert Role(name=".hidden-role")
 
 
 def test_get_and_list_send_one_get_and_return_the_response_unchanged() -> None:
@@ -149,6 +114,32 @@ def test_a_name_is_encoded_so_it_cannot_change_the_endpoint() -> None:
     assert transport.calls == [
         ("GET", "_plugins/_security/api/roles/a%2Fb%3Fc%20d", None)
     ]
+
+
+def test_a_name_that_would_not_address_one_object_is_refused_without_a_request() -> (
+    None
+):
+    calls: list[Callable[[OpensearchClient, str], OpensearchResult[Any]]] = [
+        security.get_role,
+        security.get_user,
+        security.get_role_mapping,
+        security.role_exists,
+        security.user_exists,
+        security.role_mapping_exists,
+    ]
+
+    for blank_or_dot in ("", "   ", ".", ".."):
+        for call in calls:
+            transport = RecordingTransport()
+            result = call(OpensearchClient(transport), blank_or_dot)
+            assert not result
+            assert "is not valid" in result.reason
+            assert transport.calls == []
+
+    # A name that merely starts with a dot is fine.
+    transport = RecordingTransport()
+    assert security.get_role(OpensearchClient(transport), ".hidden-role")
+    assert len(transport.calls) == 1
 
 
 def test_existence_checks_report_true_false_or_the_failure() -> None:
@@ -222,45 +213,90 @@ def test_create_puts_only_when_the_object_is_absent() -> None:
         assert unchecked.calls == [("GET", path, None)]
 
 
-def test_a_name_that_would_not_address_one_object_is_refused_without_a_request() -> (
-    None
-):
-    calls: list[Callable[[OpensearchClient, str], OpensearchResult[Any]]] = [
-        security.get_role,
-        security.get_user,
-        security.get_role_mapping,
-        security.role_exists,
-        security.user_exists,
-        security.role_mapping_exists,
-        lambda client, name: security.create_role(client, Role(name=name)),
-        lambda client, name: security.create_user(
-            client, User(name=name, password="a-secret-value")
-        ),
-        lambda client, name: security.create_role_mapping(client, RoleMapping(name)),
-    ]
-
-    for blank_or_dot in ("", "   ", ".", ".."):
-        for call in calls:
-            transport = RecordingTransport()
-            result = call(OpensearchClient(transport), blank_or_dot)
-            assert not result
-            assert "is not valid" in result.reason
-            assert transport.calls == []
-
-    # A name that merely starts with a dot is fine.
-    transport = RecordingTransport()
-    assert security.get_role(OpensearchClient(transport), ".hidden-role")
-    assert len(transport.calls) == 1
-
-
-def test_create_user_refuses_an_empty_password_without_a_request() -> None:
-    transport = RecordingTransport()
-
-    result = security.create_user(
-        OpensearchClient(transport), User(name="example-user")
+def test_the_logging_writer_role_may_only_check_and_write_its_indexes() -> None:
+    built = security.build_logging_writer_role(
+        "example-writer", ("example-logs-*", "other-logs")
     )
 
+    assert built
+    assert built.data.name == "example-writer"
+    assert built.data.to_dict() == {
+        "cluster_permissions": ["indices:data/write/bulk"],
+        "index_permissions": [
+            {
+                "index_patterns": ["example-logs-*", "other-logs"],
+                "allowed_actions": ["indices:admin/get", "index"],
+            }
+        ],
+    }
+
+
+def test_the_logging_writer_role_refuses_a_name_or_patterns_that_are_not_safe() -> None:
+    refused = [
+        ("", ("example-logs",), "is not valid"),
+        ("..", ("example-logs",), "is not valid"),
+        ("example-role", (), "needs at least one index pattern"),
+        ("example-role", ("",), "is blank"),
+        ("example-role", ("   ",), "is blank"),
+        ("example-role", ("*",), "'*'"),
+        ("example-role", ("example-logs", "*"), "'*'"),
+    ]
+
+    for name, patterns, expected in refused:
+        result = security.build_logging_writer_role(name, patterns)
+        assert not result
+        assert expected in result.reason
+
+    # A wildcard that is narrower than a bare '*' is fine.
+    assert security.build_logging_writer_role("example-role", ("example-*",))
+
+
+def test_create_service_account_creates_the_role_then_the_user_then_the_mapping() -> (
+    None
+):
+    role = security.build_logging_writer_role("example-role", ("example-logs",)).data
+    user = User(name="example-user", password="a-secret-value")
+    absent = Failure("404 from GET", status=404)
+    acknowledged = Success({"status": "CREATED"})
+    transport = ScriptedTransport(
+        [absent, acknowledged, absent, acknowledged, absent, acknowledged]
+    )
+
+    result = security.create_service_account(OpensearchClient(transport), user, role)
+
+    assert result == Success(
+        {"role": "example-role", "user": "example-user", "role_mapping": "example-role"}
+    )
+    roles = "_plugins/_security/api/roles/example-role"
+    users = "_plugins/_security/api/internalusers/example-user"
+    mappings = "_plugins/_security/api/rolesmapping/example-role"
+    assert transport.calls == [
+        ("GET", roles, None),
+        ("PUT", roles, role.to_dict()),
+        ("GET", users, None),
+        ("PUT", users, user.to_dict()),
+        ("GET", mappings, None),
+        ("PUT", mappings, {"users": ["example-user"]}),
+    ]
+
+
+def test_create_service_account_reports_what_was_created_before_a_failure() -> None:
+    role = security.build_logging_writer_role("example-role", ("example-logs",)).data
+    user = User(name="example-user", password="a-secret-value")
+    # The role is new, but the user already exists.
+    transport = ScriptedTransport(
+        [
+            Failure("404 from GET", status=404),
+            Success({"status": "CREATED"}),
+            Success({"example-user": {}}),
+        ]
+    )
+
+    result = security.create_service_account(OpensearchClient(transport), user, role)
+
     assert not result
-    assert "example-user" in result.reason
-    assert "needs a password" in result.reason
-    assert transport.calls == []
+    assert result.status == 409
+    assert "user" in result.reason
+    assert result.data == {"created": ["role"]}
+    assert len(transport.calls) == 3
+    assert "a-secret-value" not in result.reason

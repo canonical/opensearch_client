@@ -3,30 +3,42 @@
 
 """Manage Security plugin accounts: roles, internal users and role mappings.
 
-SKELETON: every function below is a declaration with no behaviour yet.
+SKELETON: some functions below are declarations with no behaviour yet.
 
 This module calls the Security REST API through
 :meth:`~osclient.client.OpensearchClient.request`; the client has no methods of its
 own for it, and the API paths live here. Two parts:
 
-- The classes model the request bodies of that API. Their field names are the JSON
-  keys (a role, user or mapping is an object keyed by its name). ``to_dict``
-  builds a request body. Responses are not parsed into these classes: the ``get_*``
-  and ``list_*`` functions return the response JSON.
+- The classes model the request bodies this module sends, and only the fields a
+  service account needs; the API accepts more. Their field names are the JSON
+  keys. ``to_dict`` builds a request body. Responses are not parsed into these
+  classes: the ``get_*`` and ``list_*`` functions return the response JSON.
 - The functions work with those classes and return
   :class:`~osclient.result.OpensearchResult`; an expected failure is a value, not
   an exception.
 
-Rules the functions follow:
+Documentation of the API, which these docstrings were checked against:
 
+- Roles: https://docs.opensearch.org/latest/security/api/roles/create-role/
+- Internal users: https://docs.opensearch.org/latest/security/api/users/create-user/
+- Role mappings:
+  https://docs.opensearch.org/latest/security/api/role-mappings/create-role-mapping/
+- Action groups such as ``index`` and ``read``:
+  https://docs.opensearch.org/latest/security/access-control/default-action-groups/
+- Permission names such as ``indices:data/write/bulk``:
+  https://docs.opensearch.org/latest/security/access-control/permissions/
+
+Rules that apply throughout:
+
+- A class refuses invalid values when it is created: its ``__post_init__`` raises
+  ``ValueError``, so an invalid object never exists. A function that takes a bare
+  name instead returns a failure.
 - Creation is create-only. A role, user or mapping that already exists is never
   overwritten: ``create_*`` returns a failure instead. Replacing means deleting
-  and creating again.
+  and creating again. (The API itself creates or replaces.)
 - A password is write-only. It is accepted when a user is created, is never
-  returned by the API, and is kept out of ``repr`` and ``to_dict`` unless set.
-  Nothing here generates a password.
-- Server-set fields (``reserved``, ``hidden``, ``static``, and a user's ``hash``)
-  appear in responses and are never sent; the classes do not model them.
+  returned by the API, and is kept out of ``repr``. Nothing here generates a
+  password. Only a plain-text ``password`` is supported, not a ``hash``.
 - Secrets are never printed or logged. Output built from a raw API response goes
   through :func:`redact_secrets` first, and a request body is never logged: logs
   may be shipped to the cluster, and a logged password would then be stored in an
@@ -38,6 +50,7 @@ Dashboards console proxy (the OPENSEARCH_DASHBOARD_URL route) has not been
 verified.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
@@ -45,281 +58,18 @@ from urllib.parse import quote
 from osclient.client import OpensearchClient
 from osclient.result import Failure, OpensearchResult, Success
 
-
-@dataclass(frozen=True)
-class IndexPermission:
-    """One entry of a role's ``index_permissions``.
-
-    Example:
-        The JSON object (``dls`` is only written when set)::
-
-            {
-              "index_patterns": ["example-index-*"],
-              "dls": "<a query, as a JSON string>",
-              "fls": ["~example_field"],
-              "masked_fields": ["example_field"],
-              "allowed_actions": ["read"]
-            }
-
-    Attributes:
-        index_patterns: the indexes the permissions apply to; wildcards allowed.
-        allowed_actions: individual actions or action groups, e.g. ``index``.
-        dls: a document-level security query, or empty for none.
-        fls: field-level security; a ``~`` prefix excludes a field. Empty for none.
-        masked_fields: fields to anonymize. Empty for none.
-    """
-
-    index_patterns: tuple[str, ...]
-    allowed_actions: tuple[str, ...]
-    dls: str = ""
-    fls: tuple[str, ...] = ()
-    masked_fields: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        """Build this entry as the API's JSON object.
-
-        Returns:
-            The entry as lists and strings. ``dls`` is left out when empty.
-        """
-        body: dict[str, Any] = {"index_patterns": list(self.index_patterns)}
-        if self.dls:
-            body["dls"] = self.dls
-        body["fls"] = list(self.fls)
-        body["masked_fields"] = list(self.masked_fields)
-        body["allowed_actions"] = list(self.allowed_actions)
-        return body
-
-
-@dataclass(frozen=True)
-class TenantPermission:
-    """One entry of a role's ``tenant_permissions`` (Dashboards tenants).
-
-    Example:
-        The JSON object::
-
-            {
-              "tenant_patterns": ["human_resources"],
-              "allowed_actions": ["kibana_all_read"]
-            }
-
-    Attributes:
-        tenant_patterns: the tenants the permissions apply to; wildcards allowed.
-        allowed_actions: ``kibana_all_read`` and/or ``kibana_all_write``.
-    """
-
-    tenant_patterns: tuple[str, ...]
-    allowed_actions: tuple[str, ...]
-
-    def to_dict(self) -> dict[str, Any]:
-        """Build this entry as the API's JSON object.
-
-        Returns:
-            The entry, as lists.
-        """
-        return {
-            "tenant_patterns": list(self.tenant_patterns),
-            "allowed_actions": list(self.allowed_actions),
-        }
-
-
-@dataclass(frozen=True)
-class Role:
-    """A Security plugin role: a named set of cluster, index and tenant permissions.
-
-    Example:
-        A role as the API returns it, an object keyed by the role name (the request
-        body is the inner object)::
-
-            {
-              "example-role": {
-                "cluster_permissions": ["cluster_monitor"],
-                "index_permissions": [
-                  {
-                    "index_patterns": ["example-index-*"],
-                    "fls": [],
-                    "masked_fields": [],
-                    "allowed_actions": ["read"]
-                  }
-                ],
-                "tenant_permissions": [
-                  {
-                    "tenant_patterns": ["example-tenant"],
-                    "allowed_actions": ["kibana_all_read"]
-                  }
-                ],
-                "description": "Example role"
-              }
-            }
-
-        A response may also carry ``reserved``, ``hidden`` and ``static``, which
-        are set by the server and not modelled here.
-
-    Attributes:
-        name: the role name. In JSON it is the key, not a field.
-        cluster_permissions: cluster-level actions or action groups.
-        index_permissions: index-level permissions.
-        tenant_permissions: Dashboards tenant permissions.
-        description: free text.
-    """
-
-    name: str
-    cluster_permissions: tuple[str, ...] = ()
-    index_permissions: tuple[IndexPermission, ...] = ()
-    tenant_permissions: tuple[TenantPermission, ...] = ()
-    description: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        """Build the request body for the roles API.
-
-        Returns:
-            The three permission lists (empty ones included), and the description
-            when set. The name is left out: it goes in the URL.
-        """
-        body: dict[str, Any] = {
-            "cluster_permissions": list(self.cluster_permissions),
-            "index_permissions": [entry.to_dict() for entry in self.index_permissions],
-            "tenant_permissions": [
-                entry.to_dict() for entry in self.tenant_permissions
-            ],
-        }
-        if self.description:
-            body["description"] = self.description
-        return body
-
-
-@dataclass(frozen=True)
-class RoleMapping:
-    """Which users, backend roles and hosts receive a role.
-
-    Example:
-        A mapping as the API returns it, an object keyed by the role name (the
-        request body is the inner object)::
-
-            {
-              "example-role": {
-                "users": ["example-user"],
-                "backend_roles": ["example-backend-role"],
-                "and_backend_roles": [],
-                "hosts": ["example-host"]
-              }
-            }
-
-        A response may also carry ``description``, ``reserved``, ``hidden`` and
-        ``static``. They are not modelled: the API may not accept a description on
-        a mapping (unverified), and the rest are set by the server.
-
-    Attributes:
-        role: the role being mapped. In JSON it is the key, not a field.
-        users: user names; wildcards allowed.
-        backend_roles: a user with any of these receives the role.
-        and_backend_roles: a user must have all of these to receive the role.
-        hosts: host names or addresses; wildcards allowed.
-    """
-
-    role: str
-    users: tuple[str, ...] = ()
-    backend_roles: tuple[str, ...] = ()
-    and_backend_roles: tuple[str, ...] = ()
-    hosts: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict[str, Any]:
-        """Build the request body for the role mappings API.
-
-        Returns:
-            ``users``, ``backend_roles`` and ``hosts`` (empty ones included), and
-            ``and_backend_roles`` when set. The role name is left out: it goes in
-            the URL.
-        """
-        body: dict[str, Any] = {
-            "users": list(self.users),
-            "backend_roles": list(self.backend_roles),
-            "hosts": list(self.hosts),
-        }
-        if self.and_backend_roles:
-            body["and_backend_roles"] = list(self.and_backend_roles)
-        return body
-
-
-@dataclass(frozen=True)
-class User:
-    """An internal user of the Security plugin.
-
-    Example:
-        A user as the API returns it, an object keyed by the user name (the request
-        body is the inner object). The request body also carries a ``password``,
-        which the API never returns::
-
-            {
-              "example-user": {
-                "backend_roles": ["example-backend-role"],
-                "attributes": {"example-key": "example-value"},
-                "opendistro_security_roles": ["example-role"],
-                "description": "Example user"
-              }
-            }
-
-        A response may also carry ``hash``, ``reserved``, ``hidden`` and
-        ``static``, which are set by the server and not modelled here.
-
-    Attributes:
-        name: the user name. In JSON it is the key, not a field.
-        password: the plain-text password. Write-only: it is accepted when a user
-            is created, never returned by the API, and hidden from ``repr``.
-        backend_roles: backend roles used by role mappings.
-        opendistro_security_roles: roles mapped directly to the user; each must
-            already exist.
-        attributes: custom name-value pairs.
-        description: free text.
-    """
-
-    name: str
-    password: str = field(default="", repr=False)
-    backend_roles: tuple[str, ...] = ()
-    opendistro_security_roles: tuple[str, ...] = ()
-    attributes: dict[str, str] = field(default_factory=dict)
-    description: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        """Build the request body for the internal users API.
-
-        Never print or log the result: it holds the password.
-
-        Returns:
-            ``backend_roles``, ``attributes`` and ``opendistro_security_roles``
-            (empty ones included), the description when set, and the password when
-            set. The name is left out: it goes in the URL.
-        """
-        body: dict[str, Any] = {
-            "backend_roles": list(self.backend_roles),
-            "attributes": dict(self.attributes),
-            "opendistro_security_roles": list(self.opendistro_security_roles),
-        }
-        if self.description:
-            body["description"] = self.description
-        if self.password:
-            body["password"] = self.password
-        return body
-
-
-_ROLES_PATH = "_plugins/_security/api/roles"
-_USERS_PATH = "_plugins/_security/api/internalusers"
-_ROLE_MAPPINGS_PATH = "_plugins/_security/api/rolesmapping"
-
-
-def _path(base: str, name: str) -> str:
-    """Build the API path of one named object, encoding the name.
-
-    Encoding keeps a ``/`` or ``?`` in a name from changing which endpoint is hit.
-    """
-    return f"{base}/{quote(name, safe='')}"
+# The API reads these in a role mapping's ``users`` as wildcards, so a user name
+# containing one would map the role to every user it matches.
+_WILDCARDS = "*?"
 
 
 def _invalid_name(kind: str, name: str) -> Failure | None:
     """Refuse a name that would not address one object.
 
     A blank name makes the path the collection's, so a lookup would list every
-    object. ``.`` and ``..`` are dot segments, which an HTTP client may resolve to
-    another endpoint even though they are not encoded.
+    object (the API documents this: omit the name to get them all). ``.`` and
+    ``..`` are dot segments, which an HTTP client may resolve to another endpoint
+    even though they are not encoded.
 
     Args:
         kind: what the name is of (``role``, ``user``), for the failure message.
@@ -335,16 +85,214 @@ def _invalid_name(kind: str, name: str) -> Failure | None:
     return None
 
 
-REDACTED = "<redacted>"
+@dataclass(frozen=True)
+class Role:
+    """A Security plugin role: what an account may do on the cluster and on indexes.
 
-# Keys whose values must never be printed or logged, wherever they appear in a
-# response:
-# - password: write-only; the API never returns it, but a request body carries it.
-# - hash: the stored password hash. The API normally returns it empty, but a
-#   response could contain one, and a hash can be attacked offline.
-# Not redacted, but worth a decision: a user's ``attributes`` are free-form
-# name-value pairs and could hold anything.
-SENSITIVE_KEYS = frozenset({"password", "hash"})
+    A role has cluster permissions and, optionally, one set of index permissions: a
+    list of index patterns and the actions allowed on them. The API also supports
+    several such sets, document- and field-level security, and tenant permissions;
+    none is needed for the service accounts this module manages.
+
+    API: https://docs.opensearch.org/latest/security/api/roles/create-role/
+
+    Example:
+        The request body ``to_dict`` builds. In the API, only the entries of
+        ``index_permissions`` have required fields (``index_patterns`` and
+        ``allowed_actions``)::
+
+            {
+              "cluster_permissions": ["cluster_monitor"],
+              "index_permissions": [
+                {
+                  "index_patterns": ["example-index-*"],
+                  "allowed_actions": ["read"]
+                }
+              ]
+            }
+
+        The API returns a role as an object keyed by its name, and also carries
+        ``reserved``, ``hidden`` and ``static`` (not modelled here).
+
+    Attributes:
+        name: the role name. In the API it is part of the URL, not a body field.
+        cluster_permissions: cluster-level actions or action groups.
+        index_patterns: the indexes the index permissions apply to; wildcards
+            allowed. Empty for a role with no index permissions.
+        index_actions: individual actions or action groups allowed on
+            ``index_patterns``, e.g. ``read``. Required when there are patterns.
+
+    Raises:
+        ValueError: on creation, if the name is blank, ``.`` or ``..``; if
+            patterns are given without actions or the reverse; or if any entry of
+            a list is blank.
+    """
+
+    name: str
+    cluster_permissions: tuple[str, ...] = ()
+    index_patterns: tuple[str, ...] = ()
+    index_actions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        invalid = _invalid_name("role", self.name)
+        if invalid is not None:
+            raise ValueError(invalid.reason)
+        if bool(self.index_patterns) != bool(self.index_actions):
+            raise ValueError(
+                f"role {self.name!r}: index_patterns and index_actions must be given "
+                "together"
+            )
+        entries = (*self.cluster_permissions, *self.index_patterns, *self.index_actions)
+        if any(not entry.strip() for entry in entries):
+            raise ValueError(f"role {self.name!r}: a permission or pattern is blank")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Build the request body for the roles API.
+
+        Returns:
+            ``cluster_permissions`` and ``index_permissions`` (one entry, or none
+            if there are no index patterns). The name is left out: it goes in the
+            URL.
+        """
+        index_permissions: list[dict[str, Any]] = []
+        if self.index_patterns:
+            index_permissions.append(
+                {
+                    "index_patterns": list(self.index_patterns),
+                    "allowed_actions": list(self.index_actions),
+                }
+            )
+        return {
+            "cluster_permissions": list(self.cluster_permissions),
+            "index_permissions": index_permissions,
+        }
+
+
+@dataclass(frozen=True)
+class RoleMapping:
+    """Gives a role to named users.
+
+    The API also maps backend roles and hosts (and requires all of a set of backend
+    roles with ``and_backend_roles``); this module maps only users, by exact name.
+
+    API: https://docs.opensearch.org/latest/security/api/role-mappings/create-role-mapping/
+
+    Example:
+        The request body ``to_dict`` builds::
+
+            {"users": ["example-user"]}
+
+        The API returns a mapping as an object keyed by the role name, and also
+        carries ``backend_roles``, ``and_backend_roles``, ``hosts``, ``reserved``,
+        ``hidden`` and ``static`` (not modelled here).
+
+    Attributes:
+        role: the role being mapped. In the API it is part of the URL, not a body
+            field.
+        users: the names of the users who receive the role.
+
+    Raises:
+        ValueError: on creation, if the role name is blank, ``.`` or ``..``; if
+            there are no users; or if a user name is invalid or contains ``*`` or
+            ``?``, which the API reads as wildcards and which would give the role
+            to every user the name matches.
+    """
+
+    role: str
+    users: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        invalid = _invalid_name("role", self.role)
+        if invalid is not None:
+            raise ValueError(invalid.reason)
+        if not self.users:
+            raise ValueError(f"mapping of role {self.role!r}: needs at least one user")
+        for user in self.users:
+            invalid = _invalid_name("user", user)
+            if invalid is not None:
+                raise ValueError(f"mapping of role {self.role!r}: {invalid.reason}")
+            if any(wildcard in user for wildcard in _WILDCARDS):
+                raise ValueError(
+                    f"mapping of role {self.role!r}: user name {user!r} must not "
+                    "contain '*' or '?'"
+                )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Build the request body for the role mappings API.
+
+        Returns:
+            ``users``. The role name is left out: it goes in the URL.
+        """
+        return {"users": list(self.users)}
+
+
+@dataclass(frozen=True)
+class User:
+    """An internal user of the Security plugin, with a plain-text password.
+
+    Every ``User`` is sent to the API to create an account, and the API requires a
+    password (or a hash, which this module does not support), so an empty password
+    is invalid. The API also takes backend roles, security roles, attributes and a
+    description; none is needed here, since the account gets its role through a
+    :class:`RoleMapping`.
+
+    API: https://docs.opensearch.org/latest/security/api/users/create-user/
+
+    Example:
+        The request body ``to_dict`` builds. The API never returns the password::
+
+            {"password": "<the plain-text password>"}
+
+        The API returns a user as an object keyed by the user name, with the
+        fields ``attributes``, ``backend_roles``, ``opendistro_security_roles``,
+        ``description``, an empty ``hash``, ``reserved``, ``hidden`` and
+        ``static`` (not modelled here).
+
+    Attributes:
+        name: the user name. In the API it is part of the URL, not a body field.
+        password: the plain-text password; hidden from ``repr``. The Security
+            plugin hashes it before storing it, and a password policy applies.
+
+    Raises:
+        ValueError: on creation, if the name is blank, ``.`` or ``..``, or
+            contains ``*`` or ``?`` (see :class:`RoleMapping`); or if the password
+            is empty. The message never contains the password.
+    """
+
+    name: str
+    password: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        invalid = _invalid_name("user", self.name)
+        if invalid is not None:
+            raise ValueError(invalid.reason)
+        if any(wildcard in self.name for wildcard in _WILDCARDS):
+            raise ValueError(f"user name {self.name!r} must not contain '*' or '?'")
+        if not self.password:
+            raise ValueError(f"user {self.name!r} needs a password")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Build the request body for the internal users API.
+
+        Never print or log the result: it holds the password.
+
+        Returns:
+            ``password``. The name is left out: it goes in the URL.
+        """
+        return {"password": self.password}
+
+
+_ROLES_PATH = "_plugins/_security/api/roles"
+_USERS_PATH = "_plugins/_security/api/internalusers"
+_ROLE_MAPPINGS_PATH = "_plugins/_security/api/rolesmapping"
+
+
+def _path(base: str, name: str) -> str:
+    """Build the API path of one named object, encoding the name.
+
+    Encoding keeps a ``/`` or ``?`` in a name from changing which endpoint is hit.
+    """
+    return f"{base}/{quote(name, safe='')}"
 
 
 # -- output -------------------------------------------------------------------
@@ -368,22 +316,48 @@ def redact_secrets(data: Any) -> Any:
 # -- build ------------------------------------------------------------------
 
 
-def build_logging_writer_role(name: str, index_patterns: tuple[str, ...]) -> Role:
+def build_logging_writer_role(
+    name: str, index_patterns: tuple[str, ...]
+) -> OpensearchResult[Role]:
     """Build the least-privileged role for an account that only ships logs.
 
     The role lets an account check that its index exists and write documents to
     it (cluster ``indices:data/write/bulk``; on ``index_patterns``,
     ``indices:admin/get`` and the ``index`` action group), and nothing else. The
-    exact permission list still has to be verified against a real cluster.
+    documentation says a bulk permission must be set at both the cluster and the
+    index level, and the ``index`` group includes ``indices:data/write/bulk*``. That
+    group also includes ``indices:data/write/update*`` and
+    ``indices:admin/mapping/put``, which a log writer does not strictly need; a
+    narrower list is possible but has not been verified against a real cluster.
+    See https://docs.opensearch.org/latest/security/access-control/default-action-groups/
 
     Args:
         name: the role name.
         index_patterns: the indexes the account may write to.
 
     Returns:
-        The role.
+        The role, or a failure if :class:`Role` would refuse it (a bad name, no
+        index patterns, or a blank pattern) or a pattern is a bare ``*``. ``*``
+        would let the account write to every index, which is not least privilege; a
+        role that needs it can be built as a :class:`Role` directly.
     """
-    raise NotImplementedError
+    if "*" in index_patterns:
+        return Failure(
+            f"role {name!r}: a log-writing role must not allow the pattern '*', "
+            "which matches every index"
+        )
+    try:
+        role = Role(
+            name=name,
+            cluster_permissions=("indices:data/write/bulk",),
+            index_patterns=index_patterns,
+            index_actions=("indices:admin/get", "index"),
+        )
+    except ValueError as error:
+        if not index_patterns:
+            return Failure(f"role {name!r}: needs at least one index pattern")
+        return Failure(str(error))
+    return Success(role)
 
 
 # -- existence ----------------------------------------------------------------
@@ -471,6 +445,8 @@ def get_role(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, 
         The response JSON, an object keyed by the role name, as the API returns it;
         or a failure (status 404 when it does not exist). A blank name, ``.`` or
         ``..`` is refused without a request.
+
+    API: https://docs.opensearch.org/latest/security/api/roles/get-roles/
     """
     invalid = _invalid_name("role", name)
     if invalid is not None:
@@ -490,6 +466,8 @@ def get_user(client: OpensearchClient, name: str) -> OpensearchResult[dict[str, 
         or a failure (status 404 when it does not exist). A blank name, ``.`` or
         ``..`` is refused without a request. It is not redacted: pass it through
         :func:`redact_secrets` before printing.
+
+    API: https://docs.opensearch.org/latest/security/api/users/get-users/
     """
     invalid = _invalid_name("user", name)
     if invalid is not None:
@@ -510,6 +488,8 @@ def get_role_mapping(
         The response JSON, an object keyed by the role name, as the API returns it;
         or a failure (status 404 when the role has none). A blank name, ``.`` or
         ``..`` is refused without a request.
+
+    API: https://docs.opensearch.org/latest/security/api/role-mappings/get-role-mappings/
     """
     invalid = _invalid_name("role", role)
     if invalid is not None:
@@ -525,6 +505,8 @@ def list_roles(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
 
     Returns:
         The response JSON, an object keyed by role name, as the API returns it.
+
+    API: https://docs.opensearch.org/latest/security/api/roles/get-roles/
     """
     return client.request("GET", _ROLES_PATH)
 
@@ -538,6 +520,8 @@ def list_users(client: OpensearchClient) -> OpensearchResult[dict[str, Any]]:
     Returns:
         The response JSON, an object keyed by user name, as the API returns it. It
         is not redacted: pass it through :func:`redact_secrets` before printing.
+
+    API: https://docs.opensearch.org/latest/security/api/users/get-users/
     """
     return client.request("GET", _USERS_PATH)
 
@@ -550,6 +534,8 @@ def list_role_mappings(client: OpensearchClient) -> OpensearchResult[dict[str, A
 
     Returns:
         The response JSON, an object keyed by role name, as the API returns it.
+
+    API: https://docs.opensearch.org/latest/security/api/role-mappings/get-role-mappings/
     """
     return client.request("GET", _ROLE_MAPPINGS_PATH)
 
@@ -598,8 +584,9 @@ def create_role(
 
     Returns:
         The API's acknowledgement, or a failure. A role that already exists is a
-        failure (status 409) and is left unchanged. A name refused as in
-        :func:`get_role` fails without a request.
+        failure (status 409) and is left unchanged.
+
+    API: https://docs.opensearch.org/latest/security/api/roles/create-role/
     """
     return _create_only(
         client,
@@ -621,16 +608,10 @@ def create_user(
 
     Returns:
         The API's acknowledgement, or a failure. A user that already exists is a
-        failure (status 409) and keeps its password. A name refused as in
-        :func:`get_user`, or an empty password, fails without a request: the
-        server would reject a user without a password anyway, but only after the
-        existence check.
+        failure (status 409) and keeps its password.
+
+    API: https://docs.opensearch.org/latest/security/api/users/create-user/
     """
-    invalid = _invalid_name("user", user.name)
-    if invalid is not None:
-        return invalid
-    if not user.password:
-        return Failure(f"user {user.name!r} needs a password")
     return _create_only(
         client,
         user_exists(client, user.name),
@@ -651,8 +632,9 @@ def create_role_mapping(
 
     Returns:
         The API's acknowledgement, or a failure. A role that already has a mapping
-        is a failure (status 409) and keeps it. A role name refused as in
-        :func:`get_role_mapping` fails without a request.
+        is a failure (status 409) and keeps it.
+
+    API: https://docs.opensearch.org/latest/security/api/role-mappings/create-role-mapping/
     """
     return _create_only(
         client,
@@ -677,10 +659,29 @@ def create_service_account(
         role: the account's role.
 
     Returns:
-        A summary naming the user, role and mapping created. On a failure, a failure
-        whose data lists the steps that had already succeeded (nothing is undone).
+        A summary naming the user, role and mapping created, with the keys ``role``,
+        ``user`` and ``role_mapping``. On a failure, a failure whose data is
+        ``{"created": [...]}``, listing the steps that had already succeeded
+        (``role``, ``user``); nothing is undone. An object that already exists fails
+        with status 409 at its step; the steps before it are not undone.
     """
-    raise NotImplementedError
+    mapping = RoleMapping(role=role.name, users=(user.name,))
+    steps: list[tuple[str, Callable[[], OpensearchResult[dict[str, Any]]]]] = [
+        ("role", lambda: create_role(client, role)),
+        ("user", lambda: create_user(client, user)),
+        ("role mapping", lambda: create_role_mapping(client, mapping)),
+    ]
+    created: list[str] = []
+    for step, create in steps:
+        outcome = create()
+        if not outcome:
+            return Failure(
+                f"creating the {step} failed: {outcome.reason}",
+                data={"created": created},
+                status=outcome.status,
+            )
+        created.append(step)
+    return Success({"role": role.name, "user": user.name, "role_mapping": role.name})
 
 
 # -- delete -------------------------------------------------------------------
@@ -697,6 +698,8 @@ def delete_role(
 
     Returns:
         The API's acknowledgement, or a failure.
+
+    API: https://docs.opensearch.org/latest/security/api/roles/delete-role/
     """
     raise NotImplementedError
 
@@ -712,6 +715,8 @@ def delete_user(
 
     Returns:
         The API's acknowledgement, or a failure.
+
+    API: https://docs.opensearch.org/latest/security/api/users/delete-user/
     """
     raise NotImplementedError
 
@@ -727,5 +732,7 @@ def delete_role_mapping(
 
     Returns:
         The API's acknowledgement, or a failure.
+
+    API: https://docs.opensearch.org/latest/security/api/role-mappings/delete-role-mapping/
     """
     raise NotImplementedError
