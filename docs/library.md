@@ -46,9 +46,10 @@ method returns an `OpensearchResult`.
 - Reads: `get(path)`, `search(query)`, `search_raw(query)` (full response, with
   aggregations), `count(query)`, `sql(q)`, `sql_raw(q)` (raw jdbc), `ppl(q)`,
   `explain(q)`, `get_mapping()`, `field_mapping(field)`, `opensearch_version()`,
-  `plugin_versions()`, `get_pipeline(name=None)`, `get_index_template(name=None)`,
-  `get_legacy_template(name=None)`, `simulate_template(name, body)`,
-  `simulate_index(index, timeout=120)`, `get_component_template(name=None)`.
+  `plugin_versions()`, `get_pipeline(name=None)`,
+  `get_index_template(name=None)`, `get_legacy_template(name=None)`,
+  `simulate_template(name, body)`, `simulate_index(index, timeout=120)`,
+  `get_component_template(name=None)`.
 - Writes / admin: `index_document(document)`, `bulk(documents)`,
   `create_index(body)`, `put_mapping(mapping)`, `put_pipeline(name, body)`,
   `put_index_template(name, body)`, `delete_index_template(name)`,
@@ -89,10 +90,10 @@ that carries it, so one source writing a field as a string can cause every later
 document writing it as an object to be rejected.
 
 Composable templates (`_index_template`) replace legacy ones (`_template`): when
-any composable template matches a new index, every legacy template is ignored for
-it, not merged. A composable template built to extend a legacy one must therefore
-carry its full mappings. The client reads legacy templates but does not write
-them.
+any composable template matches a new index, every legacy template is ignored
+for it, not merged. A composable template built to extend a legacy one must
+therefore carry its full mappings. The client reads legacy templates but does
+not write them.
 
 Component templates hold reusable settings and mappings that index templates
 list in `composed_of`. They are merged in that order, then the index template's
