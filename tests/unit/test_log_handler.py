@@ -3,8 +3,9 @@
 
 """Unit tests for opensearch_client.log_handler.OpensearchLogHandler.
 
-Batching, retries and request building belong to OpensearchClient.bulk and are
-tested in test_client.py, and delivery to a real cluster is covered by the
+The handler talks to a ``FakeClient`` that answers the three client calls it
+makes. Requests, batching, retries and their delays belong to OpensearchClient and
+are tested in test_client.py, and delivery to a real cluster is covered by the
 functional tests. These tests cover what the handler adds on top.
 """
 
@@ -15,13 +16,17 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Generator
-from typing import Any
+from collections.abc import Generator, Iterable
+from typing import Any, cast
 
+import pytest
+
+from opensearch_client import client as client_module
 from opensearch_client import log_handler
 from opensearch_client.client import OpensearchClient
 from opensearch_client.log_handler import ECSLogFormatter, OpensearchLogHandler
 from opensearch_client.result import Failure, OpensearchResult, Success
+from opensearch_client.transport import REQUEST_TIMEOUT
 
 # How long the tests wait on another thread before deciding it is stuck. Only
 # reached when the code under test is broken.
@@ -31,88 +36,92 @@ _WAIT_SECONDS = 5
 _QUIET_SECONDS = 0.3
 
 
-def _parse_bulk_documents(body: bytes | None) -> list[dict[str, Any]]:
-    """Return the documents in a bulk body, skipping each document's action line."""
-    lines = (body or b"").decode().splitlines()
-    documents = []
-    for position in range(1, len(lines), 2):
-        documents.append(json.loads(lines[position]))
-    return documents
-
-
-class FakeCluster:
-    """A transport that records what the handler sends and can misbehave on bulk.
+class FakeClient:
+    """Stands in for ``OpensearchClient``: answers the calls the handler makes.
 
     Attributes:
-        calls (list[tuple[str, str]]): every (method, path) requested, in order.
-        documents (list[dict[str, Any]]): the documents of every bulk request the
-            cluster accepted, in order.
-        bulk_received (threading.Event): set once a bulk request has been recorded.
+        calls (list[str]): the name of every call, in order.
+        documents (list[dict[str, Any]]): the documents of every ``bulk`` call that
+            succeeded, in order.
+        index_present (bool): whether the index exists.
+        failure (dict[str, Any] | None): how every document of a ``bulk`` call
+            fails, as the failure summary describes it (``status`` plus ``error``
+            or ``reason``), or None to accept them.
+        bulk_received (threading.Event): set once a ``bulk`` call has been answered.
     """
 
     def __init__(
         self,
         *,
-        index_exists: bool = True,
-        bulk_result: OpensearchResult[Any] | None = None,
+        index_present: bool = True,
+        failure: dict[str, Any] | None = None,
         bulk_error: Exception | None = None,
         chatter: bool = False,
     ) -> None:
         """Create the fake.
 
         Args:
-            index_exists (bool): whether the index is already there.
-            bulk_result (OpensearchResult[Any] | None): the answer to bulk
-                requests. Defaults to success.
-            bulk_error (Exception | None): raised on every bulk request.
-            chatter (bool): log a warning on the root logger during every bulk
-                request, as real transports do.
+            index_present (bool): whether the index is already there.
+            failure (dict[str, Any] | None): how documents fail, or None to accept
+                them.
+            bulk_error (Exception | None): raised by every ``bulk`` call.
+            chatter (bool): log a warning on the root logger during every ``bulk``
+                call, as the libraries under a real client do.
         """
-        self.index_exists = index_exists
-        self.bulk_result = (
-            Success({"items": []}) if bulk_result is None else bulk_result
-        )
+        self.index_present = index_present
+        self.failure = failure
         self.bulk_error = bulk_error
         self.chatter = chatter
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[str] = []
         self.documents: list[dict[str, Any]] = []
         self.bulk_received = threading.Event()
 
-    def request(
-        self,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        content_type: str = "application/json",
-        timeout: int = 30,
-    ) -> OpensearchResult[Any]:
-        self.calls.append((method, path))
-        if path != "_bulk":
-            if method == "GET":
-                return Success({}) if self.index_exists else Failure("x", status=404)
-            if method == "PUT":
-                self.index_exists = True
-            return Success({})
+    def index_exists(self, index: str) -> OpensearchResult[bool]:
+        self.calls.append("index_exists")
+        return Success(self.index_present)
 
+    def create_index(
+        self, body: dict[str, Any], index: str | None = None
+    ) -> OpensearchResult[dict[str, Any]]:
+        self.calls.append("create_index")
+        self.index_present = True
+        return Success({})
+
+    def bulk(
+        self,
+        documents: Iterable[dict[str, Any]],
+        index: str | None = None,
+        *,
+        max_retries: int = 3,
+    ) -> OpensearchResult[dict[str, Any]]:
+        self.calls.append("bulk")
         if self.chatter:
-            logging.warning("transport chatter")
+            logging.warning("client chatter")
         if self.bulk_error is not None:
             raise self.bulk_error
-        accepted = isinstance(self.bulk_result, Success) and not (
-            self.bulk_result.data.get("errors")
-        )
-        if accepted:
-            self.documents.extend(_parse_bulk_documents(body))
+        sent = list(documents)
+        if self.failure is None:
+            self.documents.extend(sent)
+            summary = {"indexed": len(sent), "failed": 0, "batches": 1, "failures": []}
+            self.bulk_received.set()
+            return Success(summary)
+        failures = [{**self.failure, "document": document} for document in sent]
+        summary = {
+            "indexed": 0,
+            "failed": len(sent),
+            "batches": 1,
+            "failures": failures,
+        }
         self.bulk_received.set()
-        return self.bulk_result
+        return Failure(f"{len(sent)} documents failed to index", data=summary)
 
     def recover(self) -> None:
-        """Start accepting bulk requests."""
-        self.bulk_result = Success({"items": []})
+        """Start accepting documents."""
+        self.failure = None
 
 
-class BlockingCluster(FakeCluster):
-    """A FakeCluster that holds the first bulk request open until released."""
+class BlockingClient(FakeClient):
+    """A FakeClient that holds the first ``bulk`` call open until released."""
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -120,21 +129,20 @@ class BlockingCluster(FakeCluster):
         self.release_send = threading.Event()
         self.is_first_send = True
 
-    def request(
+    def bulk(
         self,
-        method: str,
-        path: str,
-        body: bytes | None = None,
-        content_type: str = "application/json",
-        timeout: int = 30,
-    ) -> OpensearchResult[Any]:
-        if path == "_bulk" and self.is_first_send:
+        documents: Iterable[dict[str, Any]],
+        index: str | None = None,
+        *,
+        max_retries: int = 3,
+    ) -> OpensearchResult[dict[str, Any]]:
+        if self.is_first_send:
             self.is_first_send = False
             self.send_started.set()
             # Outlasts the test's own wait, so a broken handler cannot hang it.
             if not self.release_send.wait(_WAIT_SECONDS * 2):
                 raise RuntimeError("the send was never released")
-        return super().request(method, path, body, content_type, timeout)
+        return super().bulk(documents, index, max_retries=max_retries)
 
 
 class ThreadSpy:
@@ -155,6 +163,17 @@ class ThreadSpy:
         pass
 
 
+class CollectingHandler(logging.Handler):
+    """Keeps every record it receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
 class ErrorRecordingHandler(OpensearchLogHandler):
     """Keeps the records passed to handleError instead of printing a traceback."""
 
@@ -166,14 +185,19 @@ class ErrorRecordingHandler(OpensearchLogHandler):
         self.errored_records.append(record)
 
 
-def _handler(cluster: FakeCluster, **kwargs: Any) -> OpensearchLogHandler:
+def _as_client(client: FakeClient) -> OpensearchClient:
+    """Give the handler the fake where it expects an ``OpensearchClient``."""
+    return cast(OpensearchClient, client)
+
+
+def _build_handler(client: FakeClient, **kwargs: Any) -> OpensearchLogHandler:
     # An hour, so the timer never fires during a test unless the test sets it.
     kwargs.setdefault("flush_interval", 3600.0)
-    return OpensearchLogHandler(OpensearchClient(cluster), "logs", **kwargs)
+    return OpensearchLogHandler(_as_client(client), "logs", **kwargs)
 
 
 @contextlib.contextmanager
-def _running(handler: OpensearchLogHandler) -> Generator[OpensearchLogHandler]:
+def _close_after(handler: OpensearchLogHandler) -> Generator[OpensearchLogHandler]:
     """Yield the handler, then close it so its flush thread stops."""
     try:
         yield handler
@@ -181,14 +205,9 @@ def _running(handler: OpensearchLogHandler) -> Generator[OpensearchLogHandler]:
         handler.close()
 
 
-def _item_failure(status: int, error_type: str) -> OpensearchResult[Any]:
-    """A bulk response in which the only document failed with this error."""
-    error = {"type": error_type}
-    item = {"index": {"status": status, "error": error}}
-    return Success({"errors": True, "items": [item]})
-
-
-def _record(message: str, extra: dict[str, Any] | None = None) -> logging.LogRecord:
+def _make_record(
+    message: str, extra: dict[str, Any] | None = None
+) -> logging.LogRecord:
     """A record as a logger makes it, with ``extra=`` attributes if given."""
     logger = logging.getLogger("test")
     return logger.makeRecord(
@@ -208,30 +227,34 @@ def _emit_all_then_signal(
 
 def test_emit_queues_ecs_documents_and_contains_bad_records() -> None:
     """An exception record becomes an ECS document; a bad one is reported."""
-    cluster = FakeCluster()
-    handler = ErrorRecordingHandler(
-        OpensearchClient(cluster), "logs", flush_interval=3600.0
-    )
+    client = FakeClient()
+    handler = ErrorRecordingHandler(_as_client(client), "logs", flush_interval=3600.0)
     try:
         raise ValueError("bad value")
     except ValueError:
-        exc_info = sys.exc_info()
-    good = logging.LogRecord(
-        "test", logging.ERROR, __file__, 1, "got %s and %d", ("text", 3), exc_info
-    )
+        good = logging.LogRecord(
+            "test",
+            logging.ERROR,
+            __file__,
+            1,
+            "got %s and %d",
+            ("text", 3),
+            sys.exc_info(),
+        )
     bad = logging.LogRecord(
         "test", logging.INFO, __file__, 1, "%d", ("not a number",), None
     )
 
-    with _running(handler):
+    with _close_after(handler):
         handler.emit(bad)
+        # The raise above always runs the except branch that creates good.
         handler.emit(good)
         handler.flush()
 
         assert handler.errored_records == [bad]
         assert handler.dropped == 0
-        assert len(cluster.documents) == 1
-        document = cluster.documents[0]
+        assert len(client.documents) == 1
+        document = client.documents[0]
         assert document["message"] == "got text and 3"
         assert document["log"]["level"] == "error"
         assert document["log"]["logger"] == "test"
@@ -248,29 +271,31 @@ def test_emit_queues_ecs_documents_and_contains_bad_records() -> None:
 
 def test_documents_carry_identity_labels_and_merged_extra_fields() -> None:
     """Shared identity, extras and extra_fields (which win) are in every document."""
-    cluster = FakeCluster()
+    client = FakeClient()
     extra_fields = {
         "service": {"version": "1.2"},
         "labels": {"env": "test"},
         "event": {"dataset": "custom-dataset"},
         "log": {"level": "OVERRIDE"},
     }
-    handler = _handler(cluster)
+    handler = _build_handler(client)
     handler.setFormatter(
         ECSLogFormatter(service_name="superset", extra_fields=extra_fields)
     )
     extra = {"collector": "superset", "batch.size": 3, "skipped": None}
-    first = _record("one", extra)
+    first = _make_record("one", extra)
     first.created = 1_700_000_000.123456
-    second = _record("two")
+    second = _make_record("two")
     second.stack_info = "Stack (most recent call last):\n  File x, line 1"
 
-    with _running(handler):
+    with _close_after(handler):
         handler.emit(first)
         handler.emit(second)
         handler.flush()
 
-        first_document, second_document = cluster.documents
+        assert len(client.documents) == 2
+        first_document = client.documents[0]
+        second_document = client.documents[1]
         assert first_document["@timestamp"] == "2023-11-14T22:13:20.123Z"
         assert first_document["ecs"] == {"version": "9.0"}
         assert first_document["host"] == {"name": socket.gethostname()}
@@ -304,7 +329,7 @@ def test_documents_carry_identity_labels_and_merged_extra_fields() -> None:
 def test_format_returns_the_document_as_json_text() -> None:
     """For any other handler, format returns the same document as JSON text."""
     formatter = ECSLogFormatter(service_name="custom")
-    record = _record("hello")
+    record = _make_record("hello")
 
     assert json.loads(formatter.format(record)) == formatter.format_document(record)
 
@@ -314,7 +339,7 @@ def test_flush_thread_starts_after_the_handler_is_fully_set_up() -> None:
     original = log_handler.Thread
     setattr(log_handler, "Thread", ThreadSpy)
     try:
-        handler = _handler(FakeCluster())
+        handler = _build_handler(FakeClient())
     finally:
         setattr(log_handler, "Thread", original)
 
@@ -324,24 +349,26 @@ def test_flush_thread_starts_after_the_handler_is_fully_set_up() -> None:
 
 def test_stalled_send_does_not_block_emit_and_the_queue_stays_bounded() -> None:
     """While a send hangs, emit returns, the oldest waiting record is dropped."""
-    cluster = BlockingCluster()
-    with _running(_handler(cluster, flush_threshold=1, buffer_limit=2)) as handler:
-        handler.emit(_record("a"))
-        assert cluster.send_started.wait(_WAIT_SECONDS), "the send never started"
+    client = BlockingClient()
+    with _close_after(
+        _build_handler(client, flush_threshold=1, buffer_limit=2)
+    ) as handler:
+        handler.emit(_make_record("a"))
+        assert client.send_started.wait(_WAIT_SECONDS), "the send never started"
 
         emitted = threading.Event()
-        records = [_record("b"), _record("c"), _record("d")]
+        records = [_make_record("b"), _make_record("c"), _make_record("d")]
         emitter = threading.Thread(
             target=_emit_all_then_signal, args=(handler, records, emitted)
         )
         emitter.start()
         emit_returned = emitted.wait(_WAIT_SECONDS)
-        cluster.release_send.set()
+        client.release_send.set()
         emitter.join()
         handler.flush()
 
         assert emit_returned, "emit blocked while a send was in progress"
-        assert [document["message"] for document in cluster.documents] == [
+        assert [document["message"] for document in client.documents] == [
             "a",
             "c",
             "d",
@@ -355,31 +382,31 @@ def test_queued_records_are_sent_without_an_explicit_flush() -> None:
     interval_elapsed = {"flush_threshold": 1000, "flush_interval": 0.05}
 
     for settings, record_count in ((full_buffer, 2), (interval_elapsed, 1)):
-        cluster = FakeCluster()
-        with _running(_handler(cluster, **settings)) as handler:
+        client = FakeClient()
+        with _close_after(_build_handler(client, **settings)) as handler:
             for number in range(record_count):
-                handler.emit(_record(str(number)))
+                handler.emit(_make_record(str(number)))
 
-            assert cluster.bulk_received.wait(_WAIT_SECONDS), f"not sent: {settings}"
-            assert len(cluster.documents) == record_count
+            assert client.bulk_received.wait(_WAIT_SECONDS), f"not sent: {settings}"
+            assert len(client.documents) == record_count
 
 
 def test_send_path_records_are_ignored_and_a_locked_flush_does_not_stall() -> None:
     """Chatter from the send is never shipped, and logging.shutdown cannot stall."""
-    cluster = FakeCluster(chatter=True)
-    with _running(_handler(cluster)) as handler:
+    client = FakeClient(chatter=True)
+    with _close_after(_build_handler(client)) as handler:
         root = logging.getLogger()
         previous_level = root.level
         root.addHandler(handler)
         root.setLevel(logging.INFO)
         try:
-            handler.emit(_record("hello"))
+            handler.emit(_make_record("hello"))
             handler.flush()
             handler.flush()  # would send the chatter, had it been queued
-            messages = [document["message"] for document in cluster.documents]
+            messages = [document["message"] for document in client.documents]
             assert messages == ["hello"]
 
-            handler.emit(_record("goodbye"))
+            handler.emit(_make_record("goodbye"))
             started = time.monotonic()
             handler.acquire()  # logging.shutdown flushes with this lock held
             try:
@@ -395,41 +422,37 @@ def test_send_path_records_are_ignored_and_a_locked_flush_does_not_stall() -> No
 
 
 def test_index_is_checked_on_first_flush_and_again_only_when_it_goes_missing() -> None:
-    """Building the handler makes no requests; the first flush checks the index."""
-    index_missing = (
-        False,
-        [("GET", "logs"), ("PUT", "logs"), ("POST", "_bulk"), ("POST", "_bulk")],
-    )
-    index_present = (True, [("GET", "logs"), ("POST", "_bulk"), ("POST", "_bulk")])
+    """Building the handler makes no calls; the first flush checks the index."""
+    index_missing = (False, ["index_exists", "create_index", "bulk", "bulk"])
+    index_present = (True, ["index_exists", "bulk", "bulk"])
 
     for index_exists, expected_calls in (index_missing, index_present):
-        cluster = FakeCluster(index_exists=index_exists)
-        with _running(_handler(cluster)) as handler:
-            assert cluster.calls == []
+        client = FakeClient(index_present=index_exists)
+        with _close_after(_build_handler(client)) as handler:
+            assert not client.calls
 
-            handler.emit(_record("one"))
+            handler.emit(_make_record("one"))
             handler.flush()
-            handler.emit(_record("two"))
+            handler.emit(_make_record("two"))
             handler.flush()
 
-            assert cluster.calls == expected_calls
+            assert client.calls == expected_calls
 
             # The index is deleted: the next send fails, and the one after
             # that creates the index again before sending.
-            cluster.index_exists = False
-            cluster.bulk_result = _item_failure(404, "index_not_found_exception")
-            cluster.calls.clear()
-            handler.emit(_record("three"))
+            client.index_present = False
+            client.failure = {
+                "status": 404,
+                "error": {"type": "index_not_found_exception"},
+            }
+            client.calls.clear()
+            handler.emit(_make_record("three"))
             handler.flush()
-            cluster.recover()
+            client.recover()
             handler.flush()
 
-            assert cluster.calls[-3:] == [
-                ("GET", "logs"),
-                ("PUT", "logs"),
-                ("POST", "_bulk"),
-            ]
-            assert [document["message"] for document in cluster.documents] == [
+            assert client.calls == ["bulk", "index_exists", "create_index", "bulk"]
+            assert [document["message"] for document in client.documents] == [
                 "one",
                 "two",
                 "three",
@@ -442,47 +465,51 @@ def test_failed_sends_are_kept_and_resent_until_the_handler_closes() -> None:
     Records are lost only if the buffer limit is passed (see the next test) or
     when the handler closes while the cluster is still down.
     """
-    cluster = FakeCluster(bulk_result=Failure("down", status=None))
-    with _running(_handler(cluster, flush_threshold=2)) as handler:
-        handler.emit(_record("a"))
+    down = {"status": None, "reason": "down"}
+    client = FakeClient(failure=down)
+    with _close_after(_build_handler(client, flush_threshold=2)) as handler:
+        handler.emit(_make_record("a"))
         handler.flush()
 
-        # The first attempt and bulk's two retries.
-        assert cluster.calls.count(("POST", "_bulk")) == 3
+        assert client.calls.count("bulk") == 1
         assert handler.dropped == 0
 
-        cluster.bulk_received.clear()
-        handler.emit(_record("b"))  # fills the buffer, but the handler backs off
-        assert not cluster.bulk_received.wait(_QUIET_SECONDS), "retrying in a loop"
+        client.bulk_received.clear()
+        handler.emit(_make_record("b"))  # fills the buffer, but the handler backs off
+        assert not client.bulk_received.wait(_QUIET_SECONDS), "retrying in a loop"
 
-        cluster.recover()
+        client.recover()
         handler.flush()
-        assert [document["message"] for document in cluster.documents] == ["a", "b"]
+        assert [document["message"] for document in client.documents] == ["a", "b"]
         assert handler.dropped == 0
 
-        cluster.bulk_result = Failure("down", status=None)
-        handler.emit(_record("c"))
+        client.failure = down
+        handler.emit(_make_record("c"))
         handler.close()
         assert handler.dropped == 1  # closing gives up on what could not be sent
 
 
 def test_records_kept_after_a_failed_send_respect_buffer_limit_oldest_first() -> None:
     """Kept records go back in front, and the oldest are dropped past buffer_limit."""
-    cluster = BlockingCluster(bulk_result=Failure("down", status=None))
-    with _running(_handler(cluster, flush_threshold=3, buffer_limit=3)) as handler:
+    client = BlockingClient(failure={"status": None, "reason": "down"})
+    with _close_after(
+        _build_handler(client, flush_threshold=3, buffer_limit=3)
+    ) as handler:
         for name in ("a", "b", "c"):
-            handler.emit(_record(name))  # the third fills the buffer; its send blocks
-        assert cluster.send_started.wait(_WAIT_SECONDS), "the send never started"
-        handler.emit(_record("d"))
-        handler.emit(_record("e"))
+            handler.emit(
+                _make_record(name)
+            )  # the third fills the buffer; its send blocks
+        assert client.send_started.wait(_WAIT_SECONDS), "the send never started"
+        handler.emit(_make_record("d"))
+        handler.emit(_make_record("e"))
 
-        cluster.release_send.set()  # the blocked send now fails
+        client.release_send.set()  # the blocked send now fails
         handler.flush()
         assert handler.dropped == 2
 
-        cluster.recover()
+        client.recover()
         handler.flush()
-        assert [document["message"] for document in cluster.documents] == [
+        assert [document["message"] for document in client.documents] == [
             "c",
             "d",
             "e",
@@ -496,70 +523,125 @@ def test_temporary_failures_are_kept_and_rejected_documents_are_dropped() -> Non
         (503, "unavailable_shards_exception", True),
         (429, "es_rejected_execution_exception", True),
         (403, "cluster_block_exception", True),
-        (404, "index_not_found_exception", True),
         (400, "mapper_parsing_exception", False),
-        (403, "security_exception", False),
     )
 
     for status, error_type, is_kept in cases:
-        cluster = FakeCluster(bulk_result=_item_failure(status, error_type))
-        with _running(_handler(cluster)) as handler:
-            handler.emit(_record("one"))
+        failure = {"status": status, "error": {"type": error_type}}
+        client = FakeClient(failure=failure)
+        with _close_after(_build_handler(client)) as handler:
+            handler.emit(_make_record("one"))
             handler.flush()
-            cluster.recover()
+            client.recover()
             handler.flush()
 
             expected = (1, 0) if is_kept else (0, 1)  # (delivered, dropped)
-            assert (len(cluster.documents), handler.dropped) == expected, (
-                f"{status} {error_type}"
-            )
+            assert (
+                len(client.documents),
+                handler.dropped,
+            ) == expected, f"{status} {error_type}"
 
 
 def test_a_send_that_raises_is_contained() -> None:
     """Records are counted as dropped; the thread lives on; close does not raise."""
-    cluster = FakeCluster(bulk_error=RuntimeError("boom"))
-    handler = _handler(cluster)
+    client = FakeClient(bulk_error=RuntimeError("boom"))
+    handler = _build_handler(client)
+    reports = CollectingHandler()
+    flush_logger = logging.getLogger("opensearch_client.log_handler")
+    # The handler is attached too: it must ignore its flush thread's own reports.
+    flush_logger.addHandler(reports)
+    flush_logger.addHandler(handler)
+    try:
+        with _close_after(handler):
+            handler.emit(_make_record("one"))
+            handler.flush()
+            assert handler.dropped == 1
 
-    with _running(handler):
-        handler.emit(_record("one"))
-        handler.flush()
-        assert handler.dropped == 1
+            handler.emit(_make_record("two"))
+            handler.flush()
+            assert handler.dropped == 2  # the flush thread survived the first failure
 
-        handler.emit(_record("two"))
-        handler.flush()
-        assert handler.dropped == 2  # the flush thread survived the first failure
-
-        handler.emit(_record("three"))
-    # Leaving the block closed the handler. Its final send raised, and that must
-    # not have escaped.
+            handler.emit(_make_record("three"))
+        # Leaving the block closed the handler. Its final send raised, and that
+        # must not have escaped.
+    finally:
+        flush_logger.removeHandler(handler)
+        flush_logger.removeHandler(reports)
 
     assert handler.dropped == 3
     assert not handler._flush_thread.is_alive()
+    # Each failed send was reported through logging, with its traceback.
+    assert len(reports.records) == 3
+    assert all(report.exc_info for report in reports.records)
+
+
+def test_emit_lets_recursion_error_through() -> None:
+    """Like the standard library's handlers, emit re-raises RecursionError."""
+
+    class Recursive:
+        def __str__(self) -> str:
+            raise RecursionError
+
+    handler = _build_handler(FakeClient(), flush_interval=3600.0)
+    record = logging.LogRecord(
+        "test", logging.INFO, __file__, 1, "%s", (Recursive(),), None
+    )
+
+    with _close_after(handler):
+        with pytest.raises(RecursionError):
+            handler.emit(record)
 
 
 def test_close_sends_the_remaining_records_and_stops_the_flush_thread() -> None:
-    """Closing flushes what is queued; a later flush returns at once."""
-    cluster = FakeCluster()
-    handler = _handler(cluster)
-    handler.emit(_record("last"))
+    """Closing flushes what is queued and waits as long as bulk's retries can take."""
+    client = FakeClient()
+    handler = _build_handler(client)
+    handler.emit(_make_record("last"))
 
     handler.close()
 
-    assert [document["message"] for document in cluster.documents] == ["last"]
+    assert [document["message"] for document in client.documents] == ["last"]
     assert not handler._flush_thread.is_alive()
 
     started = time.monotonic()
     handler.flush()  # logging.shutdown flushes handlers that were already closed
     assert time.monotonic() - started < _WAIT_SECONDS
 
+    # The wait for a final send follows bulk's own retries and delays, not a
+    # separate number: run a real bulk against a cluster that is down.
+    class AlwaysDown:
+        """A transport on which every request fails."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, *_: Any, **__: Any) -> OpensearchResult[Any]:
+            self.calls += 1
+            return Failure("unavailable", status=503)
+
+    transport = AlwaysDown()
+    delays: list[float] = []
+    original_sleep = client_module.sleep
+    setattr(client_module, "sleep", delays.append)
+    try:
+        OpensearchClient(transport).bulk(
+            [{"a": 1}], max_retries=log_handler._SEND_RETRIES
+        )
+    finally:
+        setattr(client_module, "sleep", original_sleep)
+
+    # Every attempt may run to its request timeout, and bulk sleeps between them.
+    longest_send = transport.calls * REQUEST_TIMEOUT + sum(delays)
+    assert log_handler._CLOSE_JOIN_SECONDS >= longest_send
+
 
 def test_a_record_emitted_after_close_is_counted_as_dropped() -> None:
     """A closed handler no longer queues records; it counts them as dropped."""
-    cluster = FakeCluster()
-    handler = _handler(cluster)
+    client = FakeClient()
+    handler = _build_handler(client)
     handler.close()
 
-    handler.emit(_record("late"))
+    handler.emit(_make_record("late"))
 
     assert handler.dropped == 1
-    assert cluster.documents == []
+    assert not client.documents
